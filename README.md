@@ -132,7 +132,9 @@ python recipe.py check                             # paths, modules, runtime, fr
 python recipe.py select                            # 1
 python recipe.py cleanup                           # 2   (GPU: Sidon, the codec)
 python recipe.py sets                              # 3
-python recipe.py train-lang                        # 4a  (GPU)
+python recipe.py train-lang                        # 4a  (GPU; refuses only on MEASURED free memory below
+                                                   #      [train].min_free_mib: nvidia-smi x3, then torch; if
+                                                   #      neither can measure, WARNING, proceeds, records card_free)
 python recipe.py train-spk                         # 4b  (GPU)
 python recipe.py bake                              # 5
 python recipe.py convert                           # 6
@@ -215,7 +217,8 @@ bootstrap interval.
 Checked without a GPU (2026-10-22): every module imports; every stage's `--dry-run` prints its commands; the CPU
 self-tests pass (`scripts/check_clean_room.py`, `scripts/check_publishable.py`, `src/gguf_backend.py`,
 `src/bake_voices.py`, `src/render_short.py`, `src/skipped_text.py`, `src/select_mdc.py`, `src/release_gate.py`,
-`src/checkpoint_card.py`, `trainer/test_voice_bank.py`, `trainer/test_epoch_accounting.py`); `cleanup` and `sets`
+`src/checkpoint_card.py`, `trainer/test_voice_bank.py`, `trainer/test_epoch_accounting.py`; since 2026-11-05
+`src/test_card_memory.py`, the free-memory probe with faked failures); `cleanup` and `sets`
 ran end to end on synthetic yue, zh-HK and speaker clips with Sidon and the codec replaced by CPU stand-ins (the
 language set came out as the yue rows then the zh-HK rows, zh-HK trimmed and not padded); the standard page built from a
 synthetic clip and round-tripped a code. Read-only on the lab's stored EXP-099 D1 and v0.0.1 layers,
