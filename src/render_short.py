@@ -25,12 +25,12 @@ import argparse
 import hashlib
 import json
 import os
-import subprocess
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from card_memory import check_floor  # noqa: E402
 SEED_RULE = "int(sha256(f'{digest}:{draw}')[:8], 16), passed per request as the GGUF seed"
 MIN_FREE_MIB = int(os.environ.get("CARD_FLOOR_MIB", 8500))
 
@@ -38,16 +38,6 @@ MIN_FREE_MIB = int(os.environ.get("CARD_FLOOR_MIB", 8500))
 def seed_for(digest: str, draw: int) -> int:
     """A clip's seed: fixed by its sentence and draw alone, never by render order."""
     return int(hashlib.sha256(f"{digest}:{draw}".encode()).hexdigest()[:8], 16)
-
-
-def free_mib() -> int | None:
-    try:
-        out = subprocess.run(["nvidia-smi", "--query-gpu=memory.total,memory.used", "--format=csv,noheader,nounits"],
-                             capture_output=True, text=True, timeout=30).stdout.splitlines()[0]
-        total, used = (int(x) for x in out.split(","))
-        return total - used
-    except Exception:
-        return None
 
 
 def md5(p: Path) -> str:
@@ -102,9 +92,9 @@ def render(arm: str, gguf_dir: Path, lines: Path, out: Path, draws: int, speaker
     print(f"{arm}: {len(todo)} to render, {len(done)} done", flush=True)
     if not todo:
         return 0
-    free = free_mib()
-    if free is None or free < MIN_FREE_MIB:
-        raise SystemExit(f"REFUSING: {free} MiB free on the card, floor {MIN_FREE_MIB} (CARD_FLOOR_MIB)")
+    card_free = check_floor(MIN_FREE_MIB, "floor (CARD_FLOOR_MIB)")   # refuses only on a measured value
+    runf.write_text(json.dumps({**json.loads(runf.read_text(encoding="utf-8")), "card_free": card_free}, indent=1)
+                    + "\n", encoding="utf-8")
     m = gb.GGUFModel(gguf_dir, gguf_dir.name, max_edge_s=None)
     t0 = time.time()
     try:

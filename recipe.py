@@ -24,7 +24,8 @@ a record to <work>/records/<stage>.json (commands, inputs' sha256, this reposito
 <work>/logs/<stage>.log, created before anything runs so a stage that cannot log refuses instead of running blind.
 
 WHAT THE STAGES NEED. select: CV_ROOT or an MDC archive, and DONOR_IDS. cleanup: SIDON_MODELS and a GPU. train-*: the
-base model and a GPU with [train].min_free_mib free. bake: VOICE_SOURCE. convert: the GGUF runtime
+base model and a GPU with [train].min_free_mib free (refused only on a MEASURED value below it: nvidia-smi, retried,
+then torch; if nothing can measure, a WARNING and the stage proceeds, recorded as card_free). bake: VOICE_SOURCE. convert: the GGUF runtime
 (scripts/build_gguf_runtime.sh). render/gate/card/pages: BASELINE_GGUF, EVAL_LINES, EVAL_PROSE and the evaluation
 models (README). Stages are not chained: run them in order, read each one's record, then the next.
 """
@@ -165,14 +166,11 @@ def code_commit() -> str:
         return "unknown"
 
 
-def free_mib() -> int | None:
-    try:
-        out = subprocess.run(["nvidia-smi", "--query-gpu=memory.total,memory.used", "--format=csv,noheader,nounits"],
-                             capture_output=True, text=True, timeout=30).stdout.splitlines()[0]
-        total, used = (int(x) for x in out.split(","))
-        return total - used
-    except Exception:
-        return None
+def card_memory():
+    """src/card_memory.py: nvidia-smi with retries, then torch in a subprocess; refuses only on a measured value."""
+    sys.path.insert(0, str(SRC))
+    import card_memory as cm
+    return cm
 
 
 def flag(name: str, on: bool) -> str:
@@ -370,9 +368,7 @@ def train(r: Recipe, phase: str, init: Path, data: Path, extra: list) -> dict:
             raise SystemExit(f"{out}/final_merged exists: phase {phase} is trained already (move it to retrain)")
         if not data.exists():
             raise SystemExit(f"{data} is missing: run `recipe.py sets`")
-        free = free_mib()
-        if free is None or free < t["min_free_mib"]:
-            raise SystemExit(f"REFUSING: {free} MiB free on the card, [train].min_free_mib {t['min_free_mib']}")
+        card_free = card_memory().check_floor(t["min_free_mib"], "[train].min_free_mib", python=r.py)
         out.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
     r.run(f"train-{phase}", cmd, cwd=TRAINER.parent)
@@ -380,7 +376,7 @@ def train(r: Recipe, phase: str, init: Path, data: Path, extra: list) -> dict:
         return {}
     cfg = json.loads((out / "final_merged" / "config.json").read_text(encoding="utf-8"))
     rec = {"command": [str(c) for c in cmd], "wall_s": round(time.time() - t0), "data_sha256": sha256(data),
-           "mlflow_run_id": mlflow_run_id(db), "tts_model_type": cfg.get("tts_model_type"),
+           "mlflow_run_id": mlflow_run_id(db), "card_free": card_free, "tts_model_type": cfg.get("tts_model_type"),
            "tts_model_size": cfg.get("tts_model_size"), "spk_id": cfg.get("talker_config", {}).get("spk_id")}
     if rec["tts_model_size"] != "1b7":
         raise SystemExit(f"{phase}: tts_model_size {rec['tts_model_size']!r}, not '1b7'")
@@ -566,7 +562,8 @@ def stage_check(r: Recipe) -> None:
     a = gb.availability()
     print("gguf runtime: " + ("usable" if a["usable"] else "NOT usable") + f" (cli {a['cli_present']}, converter "
           f"{a['converter_present']}, codec {a['codec_present']}); build: bash scripts/build_gguf_runtime.sh")
-    print(f"card free: {free_mib()} MiB")
+    probe = card_memory().free_mib(python=r.py)
+    print(f"card free: {probe['mib']} MiB ({probe['method'] or 'not measured: ' + '; '.join(probe['errors'])})")
 
 
 def stage_status(r: Recipe) -> None:
