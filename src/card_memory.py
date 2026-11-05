@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Free memory on the card, and the floor check every GPU stage runs before it starts.
 
-A failure to measure is not a measurement of low memory. On 2026-11-05 a GCP arm trained its language phase for 5.8
-hours, then the speaker phase refused with "None MiB free" because one nvidia-smi call failed: the old probe ran once
-and returned None on any exception, and its callers refused on None exactly as on a low reading.
+A failure to measure is not a measurement of low memory. The old probe ran nvidia-smi once and returned None on any
+exception, and its callers refused on None exactly as on a low reading, so a single failed call could stop a speaker
+phase after hours of language training.
 
 free_mib() tries nvidia-smi PROBE_TRIES times with a short backoff, then torch.cuda.mem_get_info() in a SUBPROCESS (so
 the calling process never holds a CUDA context), and returns the value WITH the method that produced it and every
