@@ -22,6 +22,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -35,6 +37,78 @@ PAUSE = {"，": 0.20, "、": 0.16, "：": 0.30, "；": 0.32, "。": 0.48, "！":
 PARA_EXTRA = 0.45
 RUNAWAY_SPC, SILENT_SPC, DEMO_REDRAW = 0.60, 0.07, 4
 TARGET_RMS_DB = -20.0
+
+
+# WHAT MADE A READ. A read rendered through qwen3-tts.cpp can be reproduced only with its seeds, the upstream commit the
+# engine was built at, the patches applied to it, and the codec it decoded with, so the manifest records all of them.
+SEED_RULE = {"function": "seed_of", "key": "story|chunk|text|draw, then |salt when a salt is set",
+             "hash": "the first 8 hex digits of the key's sha256, as an integer", "per": "request"}
+RECIPE_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _sha256(p: Path) -> str:
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for b in iter(lambda: f.read(1 << 22), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def engine_block() -> dict:
+    """The engine this run renders with. Every story render goes through the GGUF backend. A fact that cannot be
+    read here (no source checkout, no codec) is None, never guessed."""
+    import gguf_backend as gb
+    pin_expected = None
+    try:
+        m = re.search(r"QWEN_TTS_CPP_PIN:-([0-9a-f]{40})",
+                      (RECIPE_ROOT / "scripts" / "build_gguf_runtime.sh").read_text(encoding="utf-8"))
+        pin_expected = m.group(1) if m else None
+    except OSError:
+        pass
+    try:
+        r = subprocess.run(["git", "-C", str(gb.CPP_ROOT), "rev-parse", "HEAD"], capture_output=True, text=True,
+                           timeout=20)
+        pin_built = r.stdout.strip() or None if r.returncode == 0 else None
+    except OSError:
+        pin_built = None
+    patches = RECIPE_ROOT / "external" / "qwen3-tts-cpp" / "patches"
+    codec = gb._find_codec()
+    return {"backend": "gguf", "engine": "qwen3-tts.cpp", "upstream": "https://github.com/Danmoreng/qwen3-tts.cpp",
+            "pin_expected": pin_expected, "pin_built": pin_built,
+            "patches": {p.name: _sha256(p) for p in sorted(patches.glob("*.patch"))},
+            "cli_sha256": _sha256(gb.CLI_BIN) if gb.CLI_BIN.exists() else None,
+            "codec": codec.name if codec else None, "codec_sha256": _sha256(codec) if codec else None}
+
+
+def provenance_problems(man: dict) -> list[str]:
+    """Every reason a story manifest cannot say what made its read; empty when it can."""
+    eng = man.get("engine")
+    if not isinstance(eng, dict):
+        return ["no engine block: the backend, the upstream pin and patches, and the codec are unknown"]
+    why = []
+    backend = eng.get("backend")
+    if backend not in ("gguf", "torch"):
+        why.append(f"engine.backend is {backend!r}, not gguf or torch")
+    if backend == "gguf":
+        pin = eng.get("pin_built") or eng.get("pin_expected")
+        if not (isinstance(pin, str) and re.fullmatch(r"[0-9a-f]{40}", pin)):
+            why.append("engine has no upstream pin (pin_built or pin_expected, a 40-hex commit)")
+        if not isinstance(eng.get("patches"), dict):
+            why.append("engine.patches is missing (the patches the build applies, by sha256)")
+        c = eng.get("codec_sha256")
+        if not (isinstance(c, str) and re.fullmatch(r"[0-9a-f]{64}", c)):
+            why.append("engine.codec_sha256 is missing")
+    if not isinstance((man.get("rule") or {}).get("seed_rule"), dict):
+        why.append("rule.seed_rule is missing")
+    return why
+
+
+def require_provenance(man: dict, where) -> None:
+    """Refuse a manifest that cannot say what made its read, naming every missing field."""
+    why = provenance_problems(man)
+    if why:
+        raise SystemExit(f"{where}: the story manifest cannot say what made this read: {'; '.join(why)}. "
+                         "Re-render it with src/render_story.py.")
 
 
 def read_text(p: Path) -> tuple[str, list[str]]:
@@ -150,7 +224,9 @@ def main() -> int:
     man = {"texts": {sid: {"title": t, "sha256": hashlib.sha256((a.texts / f"{sid}.txt").read_bytes()).hexdigest(),
                            "chunks": len(c)} for sid, (t, c) in stories.items()},
            "rule": {"chunk_hi": a.hi, "seed_salt": a.seed_salt, "edge_s": EDGE_S, "pause": PAUSE, "para_extra": PARA_EXTRA, "runaway_spc": RUNAWAY_SPC,
-                    "silent_spc": SILENT_SPC, "max_redraw": a.redraw, "target_rms_db": TARGET_RMS_DB},
+                    "silent_spc": SILENT_SPC, "max_redraw": a.redraw, "target_rms_db": TARGET_RMS_DB,
+                    "seed_rule": SEED_RULE},
+           "engine": engine_block(),
            "arms": {}}
     for spec in a.arm:
         name, rest = spec.split("=", 1)
