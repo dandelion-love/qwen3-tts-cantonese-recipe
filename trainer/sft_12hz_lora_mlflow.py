@@ -27,6 +27,7 @@ from peft import LoraConfig, get_peft_model
 # through voice_bank.py. The single-voice path was two module globals and two inline
 # row-3000 writes until 2026-10-17; it now runs the same arithmetic from there.
 import voice_bank as vb
+import resume_position as rp
 
 
 def clean_merged_state_dict(peft_model):
@@ -69,7 +70,8 @@ def clean_merged_state_dict(peft_model):
 
 
 def write_resume_checkpoint(out_root, unwrapped, optimizer_steps, epoch, lr,
-                            recent_losses, keep_dir=[None], voice_means=None):
+                            recent_losses, keep_dir=[None], voice_means=None,
+                            epoch_micro_batches=None, optimizer=None, data_generator=None):
     """Write the raw model state plus the JSON a resume needs, atomically.
 
     DELIBERATELY NOT THE EXPORT PATH. The exported checkpoint is produced by a
@@ -79,13 +81,17 @@ def write_resume_checkpoint(out_root, unwrapped, optimizer_steps, epoch, lr,
     re-pay for hours already spent. Routing it through the export path would put that
     code on a new hot path for no benefit.
 
-    WEIGHTS ONLY, AND THE COST OF THAT IS MEASURED RATHER THAN ASSERTED. AdamW moments
-    and MasterWeightAdamW's fp32 shadows are not saved: together they are ~19.5 GiB at
-    talker scope against 4.3 for the weights, and the shadows live in a plain list on
-    the optimizer that accelerate's save_state does not reach -- so a "full state" save
-    would silently restore the moments and lose the masters, which is the mechanism that
-    makes full-weight training work at all. It would look like it worked. The resume
-    instrumentation reports the actual loss discontinuity instead.
+THE SAME DRAW, WHERE IT CAN BE (resume_position.py). Beside the weights it records the
+    data position (the epoch and the micro-batches consumed in it), the data generator's
+    state, every RNG state and, for LoRA, the optimizer state, so a resume trains on
+    exactly the batches an uninterrupted run would, in the same order, with the same
+    moments. The caller passes `optimizer=None` for a full fine-tune: there the AdamW
+    moments and MasterWeightAdamW's fp32 shadows are ~19.5 GiB at talker scope against
+    4.3 for the weights, and the shadows live in a plain list on the optimizer that
+    accelerate's save_state does not reach -- so a "full state" save would silently
+    restore the moments and lose the masters, which is the mechanism that makes
+    full-weight training work at all. Such a resume is still not the same draw, and the
+    resume instrumentation reports the actual loss discontinuity.
 
     ATOMIC, because a checkpoint half-written when the preemption lands is worse than
     none: it would be resumed from and produce silent garbage. Written to a .tmp
@@ -104,9 +110,15 @@ def write_resume_checkpoint(out_root, unwrapped, optimizer_steps, epoch, lr,
              "recent_loss_mean": (round(sum(recent_losses[-20:]) / len(recent_losses[-20:]), 6)
                                   if recent_losses else None),
              "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-             "restores": "weights, optimiser-step count, LR schedule position"
+             "restores": "weights, optimiser-step count, LR schedule position, data position, RNG states"
+                         + (", optimizer state" if optimizer is not None else "")
                          + (", each voice's running mean and clip count" if voice_means is not None else ""),
-             "does_not_restore": "AdamW exp_avg/exp_avg_sq, MasterWeightAdamW fp32 masters"}
+             "does_not_restore": ("nothing" if optimizer is not None
+                                  else "AdamW exp_avg/exp_avg_sq, MasterWeightAdamW fp32 masters")}
+    if epoch_micro_batches is not None:
+        # Inside the atomic rename, like the weights: a resume reads all of it or none.
+        state.update(rp.save(tmp, epoch=epoch, micro_batches=epoch_micro_batches,
+                             optimizer=optimizer, data_generator=data_generator))
     if voice_means is not None:
         # The voices' running means, so a resumed phase bakes the mean over EVERY clip it trained on, not only
         # the batches after the restart (PR #161 review). Inside the atomic rename, like the weights.
@@ -539,10 +551,13 @@ def train():
                              "the newest is kept.")
     parser.add_argument("--resume_from", type=str, default=None,
                         help="a step-<N> directory written by --checkpoint_every_steps. "
-                             "Restores weights, optimiser-step count and the LR schedule "
-                             "position. It does NOT restore AdamW moments or the fp32 "
-                             "masters -- see the RESUME COST instrumentation, which "
-                             "measures what that costs instead of asserting it is small.")
+                             "Restores weights, optimiser-step count, the LR schedule "
+                             "position, the data position and the RNG states, and for LoRA "
+                             "the optimizer state, so with --seed the resumed run is the "
+                             "same draw as an uninterrupted one (resume_position.py). A full "
+                             "fine-tune does NOT restore AdamW moments or the fp32 masters "
+                             "-- see the RESUME COST instrumentation, which measures what "
+                             "that costs instead of asserting it is small.")
     parser.add_argument("--max_steps", type=int, default=0,
                         help="Stop after this many optimizer steps (0 = full epochs). "
                              "The LR schedule is sized to the truncated length, so a "
@@ -951,6 +966,7 @@ def train():
                     f"Re-run precompute_ref_logp.py on --init_model_path with "
                     f"--residual-weight {args.residual_weight:g}. First: row {stale[0]}")
             pair_sampler = pdata.PairBatchSampler(kept, seed=args.pair_shuffle_seed)
+            _data_gen = None            # the pair sampler orders each epoch by its own set_epoch
             train_dataloader = DataLoader(dataset, batch_sampler=pair_sampler,
                                           collate_fn=dataset.collate_fn)
             if accelerator.is_main_process:
@@ -1010,12 +1026,14 @@ def train():
                                        "voice_slots_path": _vs_path})
                     mlflow.set_tag("voice_slots", json.dumps(voice_plan.slots,
                                                              separators=(",", ":")))
+            # Kept by name: a resume checkpoint records its state and the resume checks it.
+            _data_gen = torch.Generator().manual_seed(args.seed) if args.seed is not None else None
             train_dataloader = DataLoader(
                 dataset,
                 batch_size=args.batch_size,
                 shuffle=True,
                 collate_fn=dataset.collate_fn,
-                **({"generator": torch.Generator().manual_seed(args.seed)} if args.seed is not None else {}),
+                **({"generator": _data_gen} if _data_gen is not None else {}),
             )
 
         # Separate parameter groups so the code predictor can be adapted at a much
@@ -1138,12 +1156,25 @@ def train():
             # setter, and leaving it at step 0 would restart warmup and undo the anneal.
             for _ in range(optimizer_steps):
                 scheduler.step()
+            # THE SAME DRAW (resume_position.py): the optimizer for LoRA, then the data
+            # generator's draws for every finished epoch, then the RNG states -- in that
+            # order, because walking the sampler must not disturb the restored RNG.
+            _resume = rp.load(args.resume_from, rs,
+                              optimizer=None if args.full_ft else optimizer,
+                              data_generator=_data_gen)
+            if _resume.epoch:
+                rp.fast_forward(train_dataloader, _resume.epoch)
+            if _resume.rng is not None:
+                rp.restore_rng(_resume.rng)
             accelerator.print(
                 f"RESUME loaded step={optimizer_steps} "
                 f"lr={scheduler.get_last_lr()[0]:.3e} "
-                f"baseline_loss={resume_baseline} "
-                f"| AdamW moments and fp32 masters NOT restored -- "
-                f"RESUME_COST lines below measure what that cost")
+                f"baseline_loss={resume_baseline} | {_resume.describe()}"
+                + ("" if _resume.exact_optimizer else
+                   " -- RESUME_COST lines below measure what not restoring the optimizer cost"))
+        else:
+            _resume = rp.Position()
+        _order_checked = not args.resume_from
         # EXP-013 step-time state. A list plus a one-element list for the
         # previous timestamp, so the closure below needs no `nonlocal`.
         _step_times = []
@@ -1167,7 +1198,7 @@ def train():
                       + (f" ({_name}, mean over {voice_means.count[_name]} clips)"
                          if voice_plan.multi else ""))
 
-        for epoch in range(args.num_epochs):
+        for epoch in range(_resume.epoch, args.num_epochs):
             if accelerator.is_main_process:
                 print(f"\n=== Starting Epoch {epoch} ===")
 
@@ -1177,6 +1208,11 @@ def train():
                 pref_acc = [0.0, 0]
 
             for step, batch in enumerate(train_dataloader):
+                if epoch == _resume.epoch and step < _resume.skip:
+                    continue            # consumed before the checkpoint: no forward, no backward
+                if not _order_checked:
+                    rp.check_order(_resume, _data_gen)
+                    _order_checked = True
                 with accelerator.accumulate(model):
                     if pref:
                         # TASK-PARTICLE-DPO-001: one pair, [chosen, rejected], scored
@@ -1410,6 +1446,9 @@ def train():
                                 os.path.join(args.output_model_path, "resume"),
                                 accelerator.unwrap_model(model), optimizer_steps, epoch,
                                 scheduler.get_last_lr()[0], _recent_losses,
+                                epoch_micro_batches=step + 1,
+                                optimizer=None if args.full_ft else optimizer,
+                                data_generator=_data_gen,
                                 voice_means=voice_means)
                         # EXP-013. Nothing in this trainer measured how long a step
                         # takes, so a throughput question could only be answered by
