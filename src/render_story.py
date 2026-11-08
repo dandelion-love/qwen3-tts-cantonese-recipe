@@ -197,7 +197,8 @@ def render_arm(name: str, gguf: Path, speaker: str, stories: dict, out: Path, re
                 clips.append((np.asarray(y, dtype="float32"), sr, c))
                 rows.append({"i": i, "text": c["text"], "seed": seed, "redraws": k, "first_draw_defect": first,
                              "final_defect": bad, "s_per_char": spc,
-                             "first_s_per_char": first_spc})
+                             "first_s_per_char": first_spc,
+                             "kept": "first draw" if k == 0 else "a clean redraw" if bad is None else "the last draw: every redraw was defective"})
             sr = clips[0][1]
             parts, at = [], 0
             for (y, _, c), row in zip(clips, rows):
@@ -220,6 +221,16 @@ def render_arm(name: str, gguf: Path, speaker: str, stories: dict, out: Path, re
     return rec
 
 
+def redraw_refusal(redraw: int, published_demo: bool) -> str | None:
+    """A redraw replaces a defective first draw and is reserved for published demos."""
+    if redraw < 0:
+        return "--redraw must be non-negative"
+    if redraw and not published_demo:
+        return (f"--redraw {redraw} is for published demos only: pass --published-demo for one. "
+                "Listening tests and the release gate need every first draw, defects and all")
+    return None
+
+
 def main() -> int:
     from audio_uri import write_flac
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
@@ -228,6 +239,8 @@ def main() -> int:
     ap.add_argument("--arm", action="append", required=True, help="NAME=GGUF_DIR:SPEAKER, or NAME=GGUF_DIR:instruct:DESCRIPTION for a VoiceDesign model")
     ap.add_argument("--redraw", type=int, default=0, help="re-draw a runaway or silent chunk up to N times "
                     f"(published demos only, e.g. {DEMO_REDRAW}); default 0 keeps every first draw, for listening tests")
+    ap.add_argument("--published-demo", action="store_true", help="this render is a published demo, the only use "
+                    "--redraw is allowed for; recorded in the manifest")
     ap.add_argument("--seed-salt", default="", help="a fresh, reproducible draw of every chunk (default: the "
                     "seeds every earlier read used)")
     # 45 since 2026-10-19 (it was 70 for a few hours, 26 before): longer chunks read better (the owner, BM-DEMO-091 at
@@ -236,6 +249,8 @@ def main() -> int:
     # owner: "The quality is better with higher characters but dropped characters are no good." EXP-094 settles it.
     ap.add_argument("--hi", type=int, default=45, help="the chunk ceiling in characters (synthesize_long.chunk's hi; 26 was the earlier band, still in the v0.0.4 model card's demo pages)")
     a = ap.parse_args()
+    if refusal := redraw_refusal(a.redraw, a.published_demo):
+        ap.error(refusal)
     stories = {}
     for p in sorted(a.texts.glob("*.txt")):
         title, paras = read_text(p)
@@ -245,7 +260,7 @@ def main() -> int:
                            "chunks": len(c)} for sid, (t, c) in stories.items()},
            "rule": {"chunk_hi": a.hi, "seed_salt": a.seed_salt, "edge_s": EDGE_S, "pause": PAUSE, "para_extra": PARA_EXTRA, "runaway_spc": RUNAWAY_SPC,
                     "silent_spc": SILENT_SPC, "max_redraw": a.redraw, "target_rms_db": TARGET_RMS_DB,
-                    "seed_rule": SEED_RULE},
+                    "seed_rule": SEED_RULE, "published_demo": a.published_demo},
            "engine": engine_block(),
            "arms": {}}
     require_provenance(man, "runtime")
