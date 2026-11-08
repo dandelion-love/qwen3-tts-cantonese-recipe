@@ -163,6 +163,11 @@ def judge(y, sr, text: str) -> tuple[str | None, float]:
     return ("runaway" if spc > RUNAWAY_SPC else "silent" if spc < SILENT_SPC else None), round(spc, 3)
 
 
+def punctuation_pause(punct: str, pauses: dict, fallback: float) -> float:
+    """Use the first recognized mark, including when quotes or marks follow it."""
+    return next((pauses[ch] for ch in punct if ch in pauses), fallback)
+
+
 def render_arm(name: str, gguf: Path, speaker: str, stories: dict, out: Path, redraw: int = 0,
                salt: str = "") -> dict:
     import gguf_backend as gb
@@ -198,8 +203,8 @@ def render_arm(name: str, gguf: Path, speaker: str, stories: dict, out: Path, re
             for (y, _, c), row in zip(clips, rows):
                 row["span"] = [at, at + len(y)]            # samples in the read, for cutting it by paragraph later
                 parts.append(y)
-                at += len(y) + int((PAUSE.get(c["punct"], PAUSE[""]) + (PARA_EXTRA if c["last_in_para"] else 0.0)) * sr)
-                pause = PAUSE.get(c["punct"], PAUSE[""]) + (PARA_EXTRA if c["last_in_para"] else 0.0)
+                at += len(y) + int((punctuation_pause(c["punct"], PAUSE, PAUSE[""]) + (PARA_EXTRA if c["last_in_para"] else 0.0)) * sr)
+                pause = punctuation_pause(c["punct"], PAUSE, PAUSE[""]) + (PARA_EXTRA if c["last_in_para"] else 0.0)
                 parts.append(np.zeros(int(pause * sr), dtype="float32"))
             read = np.concatenate(parts[:-1])
             loud = read[np.abs(read) > 1e-3]

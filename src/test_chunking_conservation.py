@@ -2,6 +2,7 @@
 import sys
 import unicodedata
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -36,6 +37,34 @@ class ChunkConservation(unittest.TestCase):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 chunk(text, 14, 26)
         self.assertEqual(chunk('  ', 14, 26), [])
+
+    def test_punctuation_pause_and_real_story_join(self):
+        import numpy as np
+        import audio_trim
+        import gguf_backend
+        import render_story as story
+        for marks, expected in (("\uff1f\uff01", 0.50), ("\u3002\u300d", 0.48),
+                                ("\uff0c\uff01", 0.20), ("\uff1f", 0.50), ("", 0.18)):
+            with self.subTest(marks=marks):
+                self.assertEqual(story.punctuation_pause(marks, story.PAUSE, story.PAUSE[""]), expected)
+
+        class FakeModel:
+            def __init__(self, *args, **kwargs):
+                self.requests = []
+            def generate_custom_voice(self, **kwargs):
+                self.requests.append(kwargs['text'][0])
+                return [np.ones(10, dtype='float32')], 1000
+            def close(self):
+                pass
+
+        plan = story.plan(['abcdefghij\uff1f\uff01klmnopqrst\u3002'], hi=12)
+        with mock.patch.object(gguf_backend, 'GGUFModel', FakeModel), \
+             mock.patch.object(story, 'judge', return_value=(None, 0.1)), \
+             mock.patch.object(audio_trim, 'trim_edges', side_effect=lambda y, sr, **kw: (y, {})):
+            result = story.render_arm('fixture', Path('synthetic'), 'voice', {'s': ('title', plan)}, Path('.'))
+        rows = result['s']['chunks']
+        self.assertEqual(rows[1]['span'][0] - rows[0]['span'][1], 500)
+        self.assertEqual([row['text'] for row in rows], [item['text'] for item in plan])
 
     def test_story_plan_passes_each_surviving_character_once(self):
         import render_story
