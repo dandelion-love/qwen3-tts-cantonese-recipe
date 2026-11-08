@@ -234,6 +234,12 @@ OBJECTIVELY_BETTER.
 The recipe has not yet produced a model. Acceptance (the lab's TASK-RECIPE-RELEASE-001) is a from-scratch run of these
 commands that passes the gate and the owner's listen.
 
+## Story render checks
+
+The recipe's [story judge at fd625d6](https://github.com/dandelion-love/qwen3-tts-cantonese-recipe/blob/fd625d6e1e9efa6d29dccb4191dd097016c09407/src/render_story.py) classifies speech-span seconds per counted character, with the near-silent bar at 0.07. It is a duration check, not a loudness measurement. The lab also has a separate `tts_api.defects` passage check; that implementation is not present in this recipe at fd625d6, so the lab's mapping between two judges does not govern a second recipe judge. `python src/test_story_judge.py` checks the recipe threshold and a planted change to 0.08.
+
+Story renders keep the first draw by default. `--redraw N` requires an explicit `--published-demo`; the manifest records that choice and, for each chunk, which draw was kept and why. The checkpoint card refuses redrawn reads. The demo flag is the caller's declaration, not proof of publication.
+
 ## Open items
 
 - **Gate A2 and Part B** are tables above, not code here. v0.0.5's Part B (long prose: defects, chunk CER, skipped
