@@ -155,6 +155,12 @@ def cjk_len(s: str) -> int:
 
 
 def judge(y, sr, text: str) -> tuple[str | None, float]:
+    """The story path's first-draw verdict: `"runaway"`, `"silent"` or None, and the seconds per character.
+
+    It measures the speech span (first to last loud frame, edges trimmed to nothing) over CJK characters plus a third of
+    the ASCII letters and digits, against absolute bars: runaway above RUNAWAY_SPC, silent below SILENT_SPC, both
+    strict. "Silent" means a clip too SHORT for its text, not a quiet one: there is no loudness floor here.
+    """
     from audio_trim import trim_edges
     _, edge = trim_edges(y, sr, max_edge_s=0.0)
     speech = (edge["end_sample"] - edge["start_sample"]) / sr
