@@ -152,6 +152,15 @@ git -C "$SRC" reset -q --hard "$UPSTREAM_PIN"
 git -C "$SRC" submodule update --init --recursive
 git -C "$SRC" clean -qfd -e build
 
+PATCH_SNAPSHOT="$(mktemp)"
+trap 'rm -f "$PATCH_SNAPSHOT"' EXIT
+python3 - "$PATCHES" "$PATCH_SNAPSHOT" <<'PYCODE'
+import hashlib, json, pathlib, sys
+patches = pathlib.Path(sys.argv[1])
+pathlib.Path(sys.argv[2]).write_text(json.dumps({p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+    for p in sorted(patches.glob("*.patch"))}, sort_keys=True))
+PYCODE
+
 # ---- patches --------------------------------------------------------------
 shopt -s nullglob
 PATCH_FILES=("$PATCHES"/*.patch)
@@ -172,9 +181,21 @@ else
   done
 fi
 
+# Capture the source that is about to be compiled, including applied tracked
+# changes and submodule state. Refuse an unexpected pin or dirty submodules.
+SOURCE_HEAD="$(git -C "$SRC" rev-parse HEAD)"
+REQUESTED_HEAD="$(git -C "$SRC" rev-parse "${UPSTREAM_PIN}^{commit}")"
+[ "$SOURCE_HEAD" = "$REQUESTED_HEAD" ] || die "source HEAD differs from requested pin"
+git -C "$SRC" submodule foreach --quiet --recursive 'test -z "$(git status --porcelain)"' \
+  || die "a source submodule is dirty"
+SOURCE_DIFF="$(git -C "$SRC" diff --binary HEAD | sha256sum | cut -d' ' -f1)"
+SUBMODULE_STATE="$(git -C "$SRC" submodule status --recursive)"
+
 # ---- build ----------------------------------------------------------------
 [ $CLEAN -eq 1 ] && [ -d "$BUILD" ] && { say "removing $BUILD"; rm -rf "$BUILD"; }
 mkdir -p "$BUILD"
+# A failed rebuild must never leave a stale stamp beside the binary.
+rm -f "$BUILD/qwen3-tts-cli.build.json"
 
 # These flags are the ones the recorded measurements were taken with.
 # CMAKE_CUDA_ARCHITECTURES=86 is this machine's card (RTX 30-series); override with
@@ -214,6 +235,41 @@ else
   die "the built binary has no --serve. The patch did not take effect.
      Re-run with --reclone; if it persists the patch needs rebasing onto the pin."
 fi
+
+# Refuse a build whose source changed while the compiler was running.
+[ "$(git -C "$SRC" rev-parse HEAD)" = "$SOURCE_HEAD" ] || die "source HEAD changed during build"
+[ "$(git -C "$SRC" diff --binary HEAD | sha256sum | cut -d' ' -f1)" = "$SOURCE_DIFF" ] || die "source changes changed during build"
+[ "$(git -C "$SRC" submodule status --recursive)" = "$SUBMODULE_STATE" ] || die "submodule state changed during build"
+git -C "$SRC" submodule foreach --quiet --recursive 'test -z "$(git status --porcelain)"' \
+  || die "a source submodule changed during build"
+
+# Bind the source and applied patch snapshot to the verified binary. The temporary
+# file is in the same directory so rename publishes a complete stamp atomically.
+# Checks detect ordinary concurrent source edits, but cannot exclude an edit and
+# restoration between checks; exclusive build-directory use remains necessary.
+python3 - "$CLI" "$SRC" "$PATCHES" "$PATCH_SNAPSHOT" "$SOURCE_HEAD" <<'PYCODE'
+import hashlib, json, os, pathlib, subprocess, sys, tempfile
+cli, src, patches, snapshot = map(pathlib.Path, sys.argv[1:5])
+pin = sys.argv[5]
+hash_file = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
+expected = json.loads(snapshot.read_text())
+current = {p.name: hash_file(p) for p in sorted(patches.glob("*.patch"))}
+if current != expected:
+    raise SystemExit("patch inputs changed during build; refusing provenance stamp")
+tree = subprocess.check_output(["git", "-C", str(src), "ls-tree", pin, "ggml"], text=True).split()
+stamp = {"version": 1, "pin_built": pin, "ggml_commit": tree[2] if len(tree) >= 3 and tree[1] == "commit" else None,
+         "patches_built": expected, "cli_sha256": hash_file(cli)}
+fd, tmp = tempfile.mkstemp(prefix=cli.name + ".build.", dir=cli.parent)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(stamp, f, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, str(cli) + ".build.json")
+finally:
+    if os.path.exists(tmp):
+        os.unlink(tmp)
+PYCODE
+
 
 cat <<EOF
 

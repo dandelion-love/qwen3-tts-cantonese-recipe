@@ -23,7 +23,6 @@ import argparse
 import hashlib
 import json
 import re
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -65,19 +64,26 @@ def engine_block() -> dict:
         pin_expected = m.group(1) if m else None
     except OSError:
         pass
-    try:
-        r = subprocess.run(["git", "-C", str(gb.CPP_ROOT), "rev-parse", "HEAD"], capture_output=True, text=True,
-                           timeout=20)
-        pin_built = r.stdout.strip() or None if r.returncode == 0 else None
-    except OSError:
-        pin_built = None
     patches = RECIPE_ROOT / "external" / "qwen3-tts-cpp" / "patches"
+    expected = {p.name: _sha256(p) for p in sorted(patches.glob("*.patch"))}
+    cli = gb.CLI_BIN
+    cli_hash = _sha256(cli) if cli.is_file() else None
+    stamp = None
+    try:
+        candidate = json.loads(Path(str(cli) + ".build.json").read_text(encoding="utf-8"))
+        if (isinstance(candidate, dict) and candidate.get("version") == 1 and cli_hash
+                and candidate.get("cli_sha256") == cli_hash):
+            stamp = candidate
+    except (OSError, ValueError):
+        pass
     codec = gb._find_codec()
     return {"backend": "gguf", "engine": "qwen3-tts.cpp", "upstream": "https://github.com/Danmoreng/qwen3-tts.cpp",
-            "pin_expected": pin_expected, "pin_built": pin_built,
-            "patches": {p.name: _sha256(p) for p in sorted(patches.glob("*.patch"))},
-            "cli_sha256": _sha256(gb.CLI_BIN) if gb.CLI_BIN.exists() else None,
-            "codec": codec.name if codec else None, "codec_sha256": _sha256(codec) if codec else None}
+            "pin_expected": pin_expected, "pin_built": stamp.get("pin_built") if stamp else None,
+            "ggml_commit": stamp.get("ggml_commit") if stamp else None,
+            "patches_expected": expected, "patches_built": stamp.get("patches_built") if stamp else None,
+            "cli_sha256": cli_hash, "codec": codec.name if codec else None,
+            "codec_sha256": _sha256(codec) if codec else None}
+
 
 
 def provenance_problems(man: dict) -> list[str]:
@@ -90,14 +96,23 @@ def provenance_problems(man: dict) -> list[str]:
     if backend not in ("gguf", "torch"):
         why.append(f"engine.backend is {backend!r}, not gguf or torch")
     if backend == "gguf":
-        pin = eng.get("pin_built") or eng.get("pin_expected")
-        if not (isinstance(pin, str) and re.fullmatch(r"[0-9a-f]{40}", pin)):
-            why.append("engine has no upstream pin (pin_built or pin_expected, a 40-hex commit)")
-        if not isinstance(eng.get("patches"), dict):
-            why.append("engine.patches is missing (the patches the build applies, by sha256)")
-        c = eng.get("codec_sha256")
-        if not (isinstance(c, str) and re.fullmatch(r"[0-9a-f]{64}", c)):
-            why.append("engine.codec_sha256 is missing")
+        for field, size in (("pin_expected", 40), ("pin_built", 40), ("ggml_commit", 40),
+                            ("cli_sha256", 64), ("codec_sha256", 64)):
+            value = eng.get(field)
+            if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{%d}" % size, value):
+                why.append("engine." + field + " is missing or invalid")
+        if eng.get("pin_built") and eng.get("pin_expected") and eng["pin_built"] != eng["pin_expected"]:
+            why.append("engine.pin_built differs from engine.pin_expected")
+        for field in ("patches_expected", "patches_built"):
+            value = eng.get(field)
+            if not isinstance(value, dict) or not all(isinstance(k, str) and k and isinstance(v, str)
+                                                       and re.fullmatch(r"[0-9a-f]{64}", v)
+                                                       for k, v in value.items()):
+                why.append("engine." + field + " is missing or invalid")
+        if isinstance(eng.get("patches_expected"), dict) and isinstance(eng.get("patches_built"), dict) and eng["patches_expected"] != eng["patches_built"]:
+            why.append("engine.patches_built differs from engine.patches_expected")
+        if not isinstance(eng.get("codec"), str) or not eng["codec"]:
+            why.append("engine.codec is missing")
     if not isinstance((man.get("rule") or {}).get("seed_rule"), dict):
         why.append("rule.seed_rule is missing")
     return why
@@ -228,6 +243,7 @@ def main() -> int:
                     "seed_rule": SEED_RULE},
            "engine": engine_block(),
            "arms": {}}
+    require_provenance(man, "runtime")
     for spec in a.arm:
         name, rest = spec.split("=", 1)
         gguf, speaker = rest.split(":instruct:", 1) if ":instruct:" in rest else rest.rsplit(":", 1)
