@@ -245,6 +245,8 @@ def dropped(renders: Path, arm: str) -> dict:
     if "q" not in _ASR:
         _ASR["q"], _ASR["s"] = steps._asr("cuda:0"), steps._sensevoice("cuda:0")
     man = json.loads((renders / "manifest.json").read_text(encoding="utf-8"))
+    from render_story import require_provenance
+    require_provenance(man, renders)
     if man["rule"].get("max_redraw") not in (0, None) or man["rule"].get("skip_redrawn"):
         raise SystemExit(f"{renders}: not first draws ({man['rule']})")
     out = {}
