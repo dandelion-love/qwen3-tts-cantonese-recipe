@@ -186,6 +186,13 @@ Part A, short lines (200 held-out lines x 2 draws per voice), implemented in `sr
 
 DAMAGE_VETO if any veto fires; OBJECTIVELY_BETTER if A1 shows the candidate quieter at an end; NOT_SHOWN otherwise.
 
+**A3 and A4 fold script.** The reference lines are traditional Chinese. The recogniser sometimes writes the same
+words in simplified characters, and that is not an error. So the gate converts both the reference and the transcript
+to simplified (OpenCC t2s) before it scores A3 and A4. The stored, unfolded values are still in the output, with what
+they would have ruled. The limit: folding is many-to-one, so a swap between two traditional characters that share a
+simplified form reads as correct. The gate needs OpenCC (`opencc-python-reimplemented`, imported as `opencc`) and
+refuses to run without it.
+
 **A7 is set aside for this release, by the owner (2026-10-22).** The lab's H1 read a loudness range 0.83 dB narrower
 than v0.0.1's, which A7 vetoes. The owner reads that as "likely confounded by the uniform need of no room acoustic
 artifact": v0.0.1's renders change room from chunk to chunk, H1's do not. The lab tested that explanation the same

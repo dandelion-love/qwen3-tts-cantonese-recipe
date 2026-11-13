@@ -12,12 +12,21 @@ below rather than hidden.
                      candidate is LOWER, Bonferroni over 4 tests (2 voices x 2 ends) at 0.05      PRIMARY
     A2  length bars  NOT RUN HERE. The lab's bars are exp059's calibrated duration bars (render_ship_ab.py measure),
                      part of the experiment chain. Reported as not run; the verdict says Part A is incomplete.
-    A3  last char    Qwen3-ASR last_char_match lost, exact McNemar one-sided, worse at p < 0.05     VETO
+    A3  last char    Qwen3-ASR last character lost, script folded (see below), exact McNemar one-sided, worse at
+                     p < 0.05; the stored last_char_match is REPORTED beside it                    VETO
     A4  CER          Qwen3-ASR CER per clip: Wilcoxon one-sided higher at p < 0.05 AND median more than 0.03 above
                      the baseline's (the concept's rule). The lab's exp071 vetoed on the Wilcoxon alone, so EXP-099
                      D1's "CER veto" (median 0.100 against 0.083, +0.017) does not fire under the codified rule.
-                     The script-folded CER (OpenCC t2s, 2026-10-22) is REPORTED beside it; whether A4 vetoes on the
-                     folded CER is the owner's decision, open as of 2026-10-22                     VETO
+                     A4 rules on the script-folded CER (see below); the stored CER is REPORTED     VETO
+
+    Script folding (A3 and A4). The reference text is traditional Chinese, and the recogniser sometimes writes the
+    same words in simplified characters. Unfolded, every such character counts as an error and a simplified final
+    character counts as a lost last character, so script alone could veto. Both the reference and the transcript are
+    converted to simplified (OpenCC t2s) before A3 and A4 are measured; the CER's denominator stays the reference's
+    character count. The stored, unfolded values stay in the output under their old keys, each test names its
+    `basis`, and `unfolded_would_veto` says what the unfolded rule would have ruled. The limit: folding is
+    many-to-one, so a swap between two traditional characters that share one simplified form reads as correct.
+    OpenCC is required: without it the gate refuses before any work, and never falls back to the unfolded values.
     A5  tone         tonefit nearest-template match (align sensevoice-ctc, syllables contour=voiced, the donor's
                      own templates), last syllable excluded; paired bootstrap, 2000 resamples, seed 20261018; 95%
                      interval of (candidate - baseline) wholly below zero                          VETO
@@ -188,20 +197,66 @@ def tone_counts(coll: str, templates: str) -> dict:
                   sum(1 for f in r["fits"][:-1] if f and f["target"])] for cid, r in c.records("tonefit").items()}
 
 
-def folded_cer(coll: str) -> dict:
-    import opencc
+OPENCC_MISSING = ("the release gate needs OpenCC to fold traditional and simplified script before A3 and A4 "
+                  "(pip install opencc-python-reimplemented, imported as `opencc`); it will not fall back to the "
+                  "unfolded CER and last character")
+
+
+def load_t2s():
+    """The traditional-to-simplified converter, or a refusal. Called before any store read or measurement."""
+    try:
+        import opencc
+    except ImportError as e:
+        raise SystemExit(f"{OPENCC_MISSING}: {e}")
+    return opencc.OpenCC("t2s")
+
+
+def script_fold(text: str, t2s) -> list[str]:
+    """The one script fold: the text converted to simplified, CJK characters only."""
+    import skipped_text as sk
+    return sk.cjk(t2s.convert(text or ""))
+
+
+def folded_scores(ref_text: str, hyp_text: str, t2s) -> dict:
+    """CER and last-character match with both sides folded. The denominator is the reference's own character count,
+    as in the stored CER."""
     import skipped_text as sk
     from checkpoint_card import _lev
-    st = _store()
-    t2s = opencc.OpenCC("t2s")
-    s = st.Store(coll)
-    asr, ing = s.records("asr", errors="drop"), s.records("ingest")
-    out = {}
-    for cid, r in asr.items():
-        if cid in ing and "hyp" in r:
-            ref = sk.cjk(ing[cid]["text"])
-            out[cid] = _lev(sk.cjk(t2s.convert(ing[cid]["text"])), sk.cjk(t2s.convert(r["hyp"]))) / max(1, len(ref))
-    return out
+    ref, fr, fh = sk.cjk(ref_text or ""), script_fold(ref_text, t2s), script_fold(hyp_text, t2s)
+    return {"cer": _lev(fr, fh) / max(1, len(ref)), "last_char_match": bool(fr) and fh[-1:] == fr[-1:]}
+
+
+def folded_asr(coll: str, ids: list[str], t2s) -> dict:
+    """Per clip, the folded scores from the stored transcript and the ingested reference. Every clip must have both."""
+    s = _store().Store(coll)
+    asr, ing = s.records("asr"), s.records("ingest")
+    missing = [c for c in ids if c not in ing or "hyp" not in asr.get(c, {})]
+    if missing:
+        raise SystemExit(f"{coll}: {len(missing)} clips have no stored transcript or reference to fold, e.g. {missing[:3]}")
+    return {c: folded_scores(ing[c]["text"], asr[c]["hyp"], t2s) for c in ids}
+
+
+def intelligibility_tests(ids: list[str], ax: dict, ay: dict, fx: dict, fy: dict, rules: dict = RULES) -> tuple:
+    """A3 and A4. ax, ay: the stored asr records (cer, last_char_match, unfolded); fx, fy: folded_scores per clip.
+    The folded values decide; the unfolded ones keep their old keys and say what they would have ruled."""
+    def a3(x, y):
+        return mcnemar_worse({c: not x[c]["last_char_match"] for c in ids}, {c: not y[c]["last_char_match"] for c in ids})
+
+    def a4(x, y):
+        dc = [x[c]["cer"] - y[c]["cer"] for c in ids]
+        mx, my = float(np.median([x[c]["cer"] for c in ids])), float(np.median([y[c]["cer"] for c in ids]))
+        p = wilcoxon_one_sided(dc)
+        w, m = p < rules["veto_alpha"], mx - my > rules["cer_median_margin"]
+        return {"median_candidate": round(mx, 4), "median_baseline": round(my, 4), "p_candidate_higher": round(p, 6),
+                "median_diff_candidate_minus_baseline": round(sorted(dc)[len(dc) // 2], 4),
+                "wilcoxon_fires": w, "median_margin_fires": m}, w and m
+    basis = "script_folded (OpenCC t2s on reference and transcript)"
+    u3, f3 = a3(ax, ay), a3(fx, fy)
+    A3 = {**u3, "folded": f3, "basis": basis, "vetoed": f3["p_one_sided"] < rules["veto_alpha"],
+          "unfolded_would_veto": u3["p_one_sided"] < rules["veto_alpha"]}
+    (u4, uv), (f4, fv) = a4(ax, ay), a4(fx, fy)
+    A4 = {**u4, "folded": f4, "basis": basis, "vetoed": fv, "unfolded_would_veto": uv}
+    return A3, A4
 
 
 # ---------------------------------------------------------------------------------------------- A6 and A9
@@ -241,6 +296,7 @@ def runaways_and_pauses(cand_rows: list[dict], base_rows: list[dict], rules: dic
 # ---------------------------------------------------------------------------------------------- the gate
 def gate(cand: str, base: str, cand_rows: list[dict], base_rows: list[dict], templates: str, rules: dict = RULES) -> dict:
     import skipped_text as sk
+    t2s = load_t2s()
     st = _store()
     ids = sorted(r["clip_id"] for r in cand_rows)
     if ids != sorted(r["clip_id"] for r in base_rows):
@@ -264,21 +320,8 @@ def gate(cand: str, base: str, cand_rows: list[dict], base_rows: list[dict], tem
                               "median_diff_baseline_minus_candidate": med(d), "p_candidate_lower": round(p, 6),
                               "alpha": alpha, "candidate_lower": p < alpha}
     T["A2_length_bars"] = {"run": False, "why": "the lab's exp059 duration bars are not part of the recipe (TODO)"}
-    lost = lambda a, c: not a[c]["last_char_match"]
-    m3 = mcnemar_worse({c: lost(ax, c) for c in ids}, {c: lost(ay, c) for c in ids})
-    T["A3_last_char"] = {**m3, "vetoed": m3["p_one_sided"] < rules["veto_alpha"]}
-    dc = [ax[c]["cer"] - ay[c]["cer"] for c in ids]
-    mx, my = float(np.median([ax[c]["cer"] for c in ids])), float(np.median([ay[c]["cer"] for c in ids]))
-    p4 = wilcoxon_one_sided(dc)
-    fx, fy = folded_cer(cand), folded_cer(base)
-    T["A4_cer"] = {"median_candidate": round(mx, 4), "median_baseline": round(my, 4), "p_candidate_higher": round(p4, 6),
-                   "median_diff_candidate_minus_baseline": round(sorted(dc)[len(dc) // 2], 4),
-                   "wilcoxon_fires": p4 < rules["veto_alpha"], "median_margin_fires": mx - my > rules["cer_median_margin"],
-                   "vetoed": p4 < rules["veto_alpha"] and mx - my > rules["cer_median_margin"],
-                   "folded_REPORTED": {"median_candidate": round(float(np.median([fx[c] for c in ids if c in fx])), 4),
-                                       "median_baseline": round(float(np.median([fy[c] for c in ids if c in fy])), 4),
-                                       "p_candidate_higher": round(wilcoxon_one_sided(
-                                           [fx[c] - fy[c] for c in ids if c in fx and c in fy]), 6)}}
+    T["A3_last_char"], T["A4_cer"] = intelligibility_tests(ids, ax, ay, folded_asr(cand, ids, t2s),
+                                                           folded_asr(base, ids, t2s), rules)
     T["A5_tone"] = tone_bootstrap(tone_counts(cand, templates), tone_counts(base, templates), rules["tone"])
     T["A6_runaways"], T["A9_pauses"] = runaways_and_pauses(cand_rows, base_rows, rules)
     live = live_pair(liveliness(cand), liveliness(base))
@@ -368,8 +411,132 @@ def self_test() -> int:
     a6, a9 = runaways_and_pauses(rows("plain"), rows("plain"), measure=meas)
     check("A6 and A9: the same audio both sides is neither", not a6["vetoed"] and not a9["vetoed"]
           and a6["candidate_over_2x"] == 0 and a9["p_one_sided"] == 1.0)
+    _self_test_script_fold(check)
     print("PASS" if not fails else f"FAIL: {fails}")
     return 1 if fails else 0
+
+
+# Sixteen-character traditional lines; most end on a character whose simplified form differs.
+FOLD_LINES = ("我們明天早上一起去圖書館借書好嗎", "這個問題很難回答你可以再說一遍嗎", "他們坐火車到東邊的城市去買點東西",
+              "今晚我們在餐廳吃飯之後一起看電影", "請你把這封信寄給住在香港的朋友們", "老師說學生們應該每天認真複習功課",
+              "銀行門口今天有很多人排隊等著換錢", "辦公室的電話響了很久都沒有人接聽")
+
+
+class _FakeStore:
+    """Store collections in memory, for running gate() on the CPU. `opened` records every collection touched."""
+    data: dict = {}
+    opened: list = []
+
+    def __init__(self, coll):
+        _FakeStore.opened.append(coll)
+        self.coll = coll
+
+    def records(self, layer, errors=None):
+        return _FakeStore.data[self.coll].get(layer, {})
+
+
+def _fake_gate(cand_hyps: list[str], base_hyps: list[str], refs: list[str], rules: dict = RULES) -> dict:
+    """gate() on stored-looking asr records (cer and last_char_match computed as the asr step computes them), with the
+    layers A3 and A4 do not read stubbed out. Restores the module afterwards."""
+    import types
+    import steps
+    g = globals()
+
+    def asr(hyps):
+        out = {}
+        for i, (ref, hyp) in enumerate(zip(refs, hyps)):
+            r, h = steps.cjk_only(ref), steps.cjk_only(hyp)
+            out[f"c{i}"] = {"hyp": hyp, "cer": round(steps.cer(r, h), 4), "last_char_match": bool(r) and h[-1:] == r[-1:]}
+        return out
+    ing = {f"c{i}": {"text": t} for i, t in enumerate(refs)}
+    edges = {f"c{i}": {"speech": False} for i in range(len(refs))}
+    _FakeStore.data = {"cand": {"asr": asr(cand_hyps), "ingest": ing, "edges": edges},
+                       "base": {"asr": asr(base_hyps), "ingest": ing, "edges": edges}}
+    keep = {k: g[k] for k in ("_store", "tone_counts", "liveliness", "live_pair", "runaways_and_pauses")}
+    g["_store"] = lambda: types.SimpleNamespace(Store=_FakeStore)
+    g["tone_counts"] = lambda coll, templates: {f"c{i}": [5, 7] for i in range(len(refs))}
+    g["liveliness"] = lambda coll: {}
+    g["live_pair"] = lambda x, y: {"loud_range_db": {"median_diff_x_minus_y": 0.0, "p_two_sided": 1.0}}
+    g["runaways_and_pauses"] = lambda cr, br, rules=RULES: ({"vetoed": False}, {"vetoed": False})
+    try:
+        rows = [{"clip_id": f"c{i}"} for i in range(len(refs))]
+        return gate("cand", "base", rows, rows, "templates", rules)
+    finally:
+        g.update(keep)
+
+
+def _self_test_script_fold(check) -> None:
+    """A3 and A4 on script-folded text: a script switch alone is no error, a real error still counts, and a missing
+    converter refuses before any work."""
+    import steps
+    t2s = load_t2s()
+    simp = [t2s.convert(t) for t in FOLD_LINES]
+    check("fold: every test line is 16 characters", all(len(steps.cjk_only(t)) == 16 for t in FOLD_LINES))
+    check("fold: the simplified form differs from the traditional on every line, and at the end on 6 of 8",
+          all(s != t for s, t in zip(simp, FOLD_LINES)) and sum(s[-1] != t[-1] for s, t in zip(simp, FOLD_LINES)) == 6)
+    # AC2: the same sentence in the other script is no error.
+    noop = [folded_scores(t, s, t2s) for t, s in zip(FOLD_LINES, simp)]
+    check("no-op: the same line in simplified scores folded CER 0 and keeps its last character",
+          all(r["cer"] == 0 and r["last_char_match"] for r in noop))
+    check("RED: unfolded, the same simplified line scores CER above 0",
+          all(steps.cer(steps.cjk_only(t), steps.cjk_only(s)) > 0 for t, s in zip(FOLD_LINES, simp)))
+    # AC3: one wrong character in 16 is exactly 1/16, in either script.
+    one_t = FOLD_LINES[0][:4] + "草" + FOLD_LINES[0][5:]
+    one_s = t2s.convert(one_t)
+    r_t, r_s = folded_scores(FOLD_LINES[0], one_t, t2s), folded_scores(FOLD_LINES[0], one_s, t2s)
+    check("detect: one wrong character, traditional transcript, is 1/16", r_t["cer"] == 1 / 16, str(r_t))
+    check("detect: one wrong character, simplified transcript, is 1/16", r_s["cer"] == 1 / 16, str(r_s))
+    refs = [FOLD_LINES[i % len(FOLD_LINES)] for i in range(40)]
+    # Gate level: the candidate differs from the baseline only by script -> A3 and A4 do not veto.
+    res = _fake_gate([t2s.convert(t) for t in refs], refs, refs)
+    a3, a4 = res["tests"]["A3_last_char"], res["tests"]["A4_cer"]
+    check("gate: script alone does not veto A3 or A4", not a3["vetoed"] and not a4["vetoed"]
+          and a4["folded"]["median_candidate"] == 0 and "A3" not in res["verdict"] and "A4" not in res["verdict"],
+          f"A3 folded p {a3['folded']['p_one_sided']}, A4 folded median {a4['folded']['median_candidate']}")
+    check("RED: gate: the unfolded rule would have vetoed both on script alone",
+          a3["unfolded_would_veto"] and a4["unfolded_would_veto"],
+          f"A3 unfolded p {a3['p_one_sided']}, A4 unfolded median {a4['median_candidate']}")
+    check("gate: the output names its basis and keeps the stored keys", a3["basis"].startswith("script_folded")
+          and a4["basis"].startswith("script_folded") and "p_one_sided" in a3 and "p_one_sided" in a3["folded"]
+          and "median_candidate" in a4 and "median_candidate" in a4["folded"])
+    # Gate level: a real difference above the margin, written in simplified, still vetoes on folded.
+    wrong = [t2s.convert(t[:4] + "草" + t[5:6] + "田" + t[7:15] + "啊") for t in refs]
+    res = _fake_gate(wrong, refs, refs)
+    a3, a4 = res["tests"]["A3_last_char"], res["tests"]["A4_cer"]
+    check("gate: three wrong characters in 16 still veto A3 and A4 on folded", a3["vetoed"] and a4["vetoed"]
+          and abs(a4["folded"]["median_candidate"] - 3 / 16) < 1e-4 and res["verdict"].startswith("DAMAGE_VETO:A3_last_char,A4_cer"),
+          f"A4 folded median {a4['folded']['median_candidate']}, verdict {res['verdict']}")
+    # AC4: OpenCC missing -> refuse before any store read or measurement, never fall back.
+    saved = sys.modules.get("opencc", "absent")
+    sys.modules["opencc"] = None          # makes `import opencc` raise ImportError
+    _FakeStore.opened = []
+    try:
+        try:
+            _fake_gate(refs, refs, refs)
+            refused = None
+        except SystemExit as e:
+            refused = str(e)
+        check("refuse: gate() without OpenCC exits with a clear error", bool(refused) and "OpenCC" in refused, str(refused))
+        check("refuse: and opened no store collection first", _FakeStore.opened == [], str(_FakeStore.opened))
+        g, argv, measured = globals(), sys.argv, []
+        keep = g["ensure_layers"]
+        g["ensure_layers"] = lambda c, t: measured.append(c)
+        sys.argv = ["release_gate.py", "--candidate", "cand", "--baseline", "base", "--candidate-manifest", "x.jsonl",
+                    "--baseline-manifest", "y.jsonl", "--templates", "t", "--measure"]
+        try:
+            main()
+            refused = None
+        except SystemExit as e:
+            refused = str(e)
+        finally:
+            g["ensure_layers"], sys.argv = keep, argv
+        check("refuse: main() without OpenCC exits before --measure runs any layer",
+              bool(refused) and "OpenCC" in refused and measured == [], str(refused))
+    finally:
+        if saved == "absent":
+            sys.modules.pop("opencc", None)
+        else:
+            sys.modules["opencc"] = saved
 
 
 def main() -> int:
@@ -388,6 +555,7 @@ def main() -> int:
         return self_test()
     if not all((a.candidate, a.baseline, a.candidate_manifest, a.baseline_manifest, a.templates)):
         ap.error("--candidate, --baseline, both manifests and --templates are required")
+    load_t2s()   # refuse before measuring, not after
     if a.measure:
         for c in (a.candidate, a.baseline):
             ensure_layers(c, a.templates)
