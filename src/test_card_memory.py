@@ -97,7 +97,10 @@ class RecipeTrain(unittest.TestCase):
         work = Path(self.td.name)
         self.data = work / "train.jsonl"
         self.data.write_text("{}\n", encoding="utf-8")
-        keys = ("batch_size", "gradient_accumulation_steps", "lr", "num_epochs", "warmup_ratio", "lora_rank",
+        self.init = work / "init"                 # train() checks the init checkpoint's size before the card
+        self.init.mkdir()
+        (self.init / "config.json").write_text('{"tts_model_size": "1b7"}', encoding="utf-8")
+        keys =("batch_size", "gradient_accumulation_steps", "lr", "num_epochs", "warmup_ratio", "lora_rank",
                 "lora_alpha", "checkpoint_every_epochs", "checkpoint_every_steps", "sub_talker_weight",
                 "attn_implementation", "seed")
         self.ran = []
@@ -114,13 +117,13 @@ class RecipeTrain(unittest.TestCase):
         with mock.patch.object(cm, "nvidia_smi_mib", flaky(*[OSError("no nvidia-smi")] * cm.PROBE_TRIES)), \
              mock.patch.object(cm, "torch_mib", flaky(RuntimeError("no CUDA"))), redirect_stderr(io.StringIO()):
             with self.assertRaises(self.Ran):
-                self.recipe.train(self.r, "spk", Path("init"), self.data, [])
+                self.recipe.train(self.r, "spk", self.init, self.data, [])
         self.assertEqual(self.ran, ["train-spk"])
 
     def test_measured_low_training_refused(self):
         with mock.patch.object(cm, "nvidia_smi_mib", flaky(5000)):
             with self.assertRaises(SystemExit) as e:
-                self.recipe.train(self.r, "spk", Path("init"), self.data, [])
+                self.recipe.train(self.r, "spk", self.init, self.data, [])
         self.assertIn("REFUSING: 5000 MiB", str(e.exception))
         self.assertEqual(self.ran, [])
 
