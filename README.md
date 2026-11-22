@@ -97,6 +97,9 @@ The release recipe trains LoRA. The trainer also runs a full fine-tune (`--full_
   bitsandbytes the trainer refuses; it never falls back to fp32 moments.
 - `--freeze_text_embedding` keeps the talker's text embedding table (151,936 x 2,048 = 311.2M parameters on the
   0.6B base) frozen: no gradient, no optimizer state, no master, and the checkpoint carries it unchanged.
+- `--full_ft_precision bf16_sr` (with `--full_ft_optimizer adamw8bit`) drops the fp32 masters: the weights stay bf16
+  and each update is rounded back to bf16 stochastically, so updates too small for round-to-nearest are kept on
+  average. `python trainer/test_full_ft_sr.py` checks the rounding and the update on CPU.
 
 Per trainable parameter that is about 10 bytes (bf16 weight and gradient, fp32 master, 8-bit moments) against 16
 with fp32 moments. The measured peak memory and step time on a 12 GB card are not recorded here yet; this section

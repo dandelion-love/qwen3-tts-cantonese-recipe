@@ -470,14 +470,65 @@ def master_weight_adamw8bit_class():
     return MasterWeightAdamW8bit
 
 
+def stochastic_round_bf16(x):
+    """Round fp32 `x` to bf16 stochastically: up with probability equal to the
+    dropped fraction, so the expected result is `x` itself.
+
+    bf16 is fp32 with the low 16 mantissa bits dropped. Adding a uniform integer
+    in [0, 2**16) to those bits and then clearing them carries into the kept bits
+    with exactly that probability; the sign is a separate bit, so the same holds
+    for negative values. Non-finite values pass through unchanged.
+    """
+    bits = x.contiguous().view(torch.int32)
+    noise = torch.randint(0, 1 << 16, x.shape, dtype=torch.int32, device=x.device)
+    out = ((bits + noise) & -65536).view(torch.float32)
+    return torch.where(torch.isfinite(x), out, x).to(torch.bfloat16)
+
+
+def stochastic_round_adamw8bit_class():
+    """8-bit AdamW that keeps bf16 weights and no fp32 masters (--full_ft_precision bf16_sr).
+
+    Round-to-nearest bf16 drops any update smaller than half a unit in the last
+    place, so at full fine-tuning rates (2e-6) most weights never change. Here each
+    bf16 tensor is widened to fp32 for its own update (with its gradient), the
+    8-bit AdamW update runs in fp32, and the result is rounded back to bf16
+    stochastically: a small update moves the weight by one unit with probability
+    proportional to its size, so it is kept on average instead of lost. The fp32
+    copy lives only for the tensor being updated, so the memory is the bf16 weights
+    plus 8-bit moments. At lr 0 the fp32 value is already a bf16 value and rounds
+    back to itself, bit for bit. Tensors that are not bf16 are updated as usual.
+    """
+    bnb = require_bitsandbytes()
+
+    class StochasticRoundAdamW8bit(bnb.optim.AdamW8bit):
+        def update_step(self, group, p, gindex, pindex):
+            if p.dtype != torch.bfloat16:
+                return super().update_step(group, p, gindex, pindex)
+            weight, grad = p.data, p.grad
+            p.data, p.grad = weight.float(), grad.float()
+            try:
+                super().update_step(group, p, gindex, pindex)
+                weight.copy_(stochastic_round_bf16(p.data))
+            finally:
+                p.data, p.grad = weight, grad
+
+    return StochasticRoundAdamW8bit
+
+
 def make_full_ft_optimizer(groups, *, lr, weight_decay=0.01, eightbit=False,
-                           masters=False, offload_master=False):
+                           masters=False, offload_master=False, stochastic_round=False):
     """The optimizer for the trainer's parameter groups.
 
     masters=False: the optimizer steps the model's own parameters (fp32 or plain
     bf16 precision). masters=True: MasterWeightAdamW or its 8-bit twin. eightbit
     raises MissingBitsandbytes rather than returning an fp32 AdamW.
+    stochastic_round=True (bf16_sr): 8-bit AdamW on the bf16 weights with
+    stochastic rounding; needs eightbit and no masters.
     """
+    if stochastic_round:
+        if masters or not eightbit:
+            raise ValueError("stochastic rounding is 8-bit AdamW on bf16 weights without masters")
+        return stochastic_round_adamw8bit_class()(groups, lr=lr, weight_decay=weight_decay)
     if masters:
         cls = master_weight_adamw8bit_class() if eightbit else MasterWeightAdamW
         return cls(groups, lr=lr, weight_decay=weight_decay,
@@ -652,14 +703,18 @@ def train():
                              "--sub_talker_weight > 0 or it trains the 16 codebook "
                              "embedding tables and nothing else.")
     parser.add_argument("--full_ft_precision", type=str, default="fp32",
-                        choices=["fp32", "bf16_master_fp32", "bf16"],
+                        choices=["fp32", "bf16_master_fp32", "bf16", "bf16_sr"],
                         help="Where the master weights live. 'fp32' loads the whole "
                              "model in float32 (7.2 GiB resident, simplest, the "
                              "A100 lane). 'bf16_master_fp32' keeps the model in "
                              "bf16 and the optimizer's copies in fp32 (2.4x less "
                              "memory, the workstation lane). 'bf16' is a measured "
                              "no-op below lr 1e-4 -- 3.9%% of weights move at 2e-6 "
-                             "-- and exists only to reproduce that finding.")
+                             "-- and exists only to reproduce that finding. "
+                             "'bf16_sr' keeps bf16 weights and no masters and rounds "
+                             "each update back to bf16 stochastically, so small "
+                             "updates are kept on average; it needs "
+                             "--full_ft_optimizer adamw8bit.")
     parser.add_argument("--full_ft_optimizer", type=str, default="adamw",
                         choices=["adamw", "adamw8bit"],
                         help="--full_ft only. 'adamw' keeps fp32 moments. 'adamw8bit' "
@@ -809,7 +864,9 @@ def train():
             parser.error("--full_ft_optimizer applies to --full_ft only; the LoRA path keeps its AdamW")
         if args.freeze_text_embedding:
             parser.error("--freeze_text_embedding applies to --full_ft only; LoRA never trains that table")
-    elif args.full_ft_optimizer == "adamw8bit":
+    if args.full_ft and args.full_ft_precision == "bf16_sr" and args.full_ft_optimizer != "adamw8bit":
+        parser.error("--full_ft_precision bf16_sr is implemented for --full_ft_optimizer adamw8bit only")
+    if args.full_ft and args.full_ft_optimizer == "adamw8bit":
         try:
             require_bitsandbytes()
         except MissingBitsandbytes as exc:
@@ -1278,8 +1335,9 @@ def train():
                                   f"{len(optimizer._pairs)} tensors")
                 assert devs == {"cpu"}, f"offload requested but masters on {devs}"
         else:
-            optimizer = make_full_ft_optimizer(groups, lr=args.lr, weight_decay=0.01,
-                                               eightbit=eightbit)
+            optimizer = make_full_ft_optimizer(
+                groups, lr=args.lr, weight_decay=0.01, eightbit=eightbit,
+                stochastic_round=args.full_ft and args.full_ft_precision == "bf16_sr")
         if accelerator.is_main_process:
             accelerator.print(
                 f"optimizer: {type(optimizer).__name__} | "
