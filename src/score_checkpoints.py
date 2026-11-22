@@ -610,7 +610,10 @@ def score(a, prepare=prepare_gguf, render=render_arm, judge_factory=asr_judge, m
     summary = {
         "made": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "checkpoints": readings,
         "base": ({"label": "base", "path": str(a.init), "note": "the untrained --init on the same lines, seeds, voice "
-                  "and judge; every reading's vs_base is its value minus this row's"} if base else
+                  "and judge; every reading's vs_base is its value minus this row's",
+                  **({"voice_caveat": "speaker phase: the base row speaks the borrowed --bake voice and each step its "
+                      "own trained voice (--own-voice), so vs_base measures the voice change as well as the training"}
+                     if a.own_voice else {})} if base else
                  {"label": None, "reason": "--no-base" if a.no_base else "no --init given"}),
         "floor": {"checkpoint": floor_ck["label"], "mode": a.floor_mode, "first": agg[floor_ck["label"]],
                   "second": agg[floor_arm], "difference": floor, **({"hook": hook_floor} if hook else {}),
