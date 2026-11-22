@@ -13,6 +13,7 @@
     python recipe.py gate                        7b. the release gate's Part A, per voice
     python recipe.py card                        7c. the checkpoint card, per voice
     python recipe.py pages                       8. the listening page (skips redrawn, by paragraph, blind, rated)
+    python recipe.py score                       after 4a/4b: every saved step-<N> of a phase scored from disk ([score])
     python recipe.py status                      the store's layers
 
 Every stage takes --dry-run (print what it would run and exit) and --config (default recipe.toml beside this file).
@@ -392,7 +393,7 @@ def stage_train_lang(r: Recipe) -> None:
 def stage_train_spk(r: Recipe) -> None:
     name = r.cfg["train"]["speaker_name"]
     rec = train(r, "spk", r.work / "train" / "lang" / "final_merged",
-                r.work / "sets" / r.cfg["sets"]["train"]["speaker"]["file"], ["--speaker_name", name])
+                r.work / "sets" / r.cfg["sets"]["train"]["speaker"]["file"], ["--speaker_name", name, *r.cfg["train"].get("speaker_extra", [])])
     if not r.dry and rec["spk_id"] != {name: 3000}:
         raise SystemExit(f"the speaker phase exported spk_id {rec['spk_id']}, not {{{name!r}: 3000}}")
     r.record("train-spk", rec)
@@ -539,6 +540,26 @@ def stage_pages(r: Recipe) -> None:
                        "note": "register the listen before it is heard; harvest every verdict"})
 
 
+# ---------------------------------------------------------------------------------------------------- score
+def stage_score(r: Recipe) -> None:
+    """Every saved step-<N> of [score].phase (and its final_merged), scored after training (src/score_checkpoints.py)."""
+    s, t = r.cfg["score"], r.cfg["train"]
+    spk = s["phase"] == "spk"            # a speaker phase's steps are scored in their own voice (their running mean)
+    run = r.work / "train" / s["phase"]
+    init = r.work / "train" / "lang" / "final_merged" if spk else r.path("base_model")
+    out = r.work / "scores" / s["phase"]
+    cmd = [r.py, SRC / "score_checkpoints.py", "--checkpoints", run / "resume", "--init", init, "--lines",
+           r.path(s["lines"]), "--out", out, "--speaker", t["speaker_name"] if spk else s["speaker"],
+           *(["--own-voice", f"{t['speaker_name']}=3000"] if spk else []), "--draws", s["draws"], "--floor-mode",
+           s["floor_mode"], "--rules", json.dumps(s["rules"]), "--lora-rank", t["lora_rank"], "--lora-alpha",
+           t["lora_alpha"], "--quant", r.cfg["convert"]["quant"]]
+    cmd += [x for n, row in s["bake"].items() for x in ("--bake", f"{n}={row}")]
+    cmd += ["--voice-source", r.path("voice_source")] if s["bake"] else []
+    cmd += ["--checkpoint", run / "final_merged"] if r.dry or (run / "final_merged").is_dir() else []
+    r.run("score", cmd + (["--scorer", s["scorer"]] if s["scorer"] else []))
+    r.record("score", {"summary": str(out / "summary.json"), "phase": s["phase"], "scorer": s["scorer"] or None})
+
+
 # ---------------------------------------------------------------------------------------------------- check, status
 def stage_check(r: Recipe) -> None:
     print("paths (recipe.toml [paths], ${VAR} from the environment):")
@@ -578,7 +599,8 @@ def stage_status(r: Recipe) -> None:
 
 STAGES = {"check": stage_check, "select": stage_select, "cleanup": stage_cleanup, "sets": stage_sets,
           "train-lang": stage_train_lang, "train-spk": stage_train_spk, "bake": stage_bake, "convert": stage_convert,
-          "render": stage_render, "gate": stage_gate, "card": stage_card, "pages": stage_pages, "status": stage_status}
+          "render": stage_render, "gate": stage_gate, "card": stage_card, "pages": stage_pages, "status": stage_status,
+          "score": stage_score}
 
 
 def main() -> int:
