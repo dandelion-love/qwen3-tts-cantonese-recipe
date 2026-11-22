@@ -71,7 +71,8 @@ def clean_merged_state_dict(peft_model):
 
 def write_resume_checkpoint(out_root, unwrapped, optimizer_steps, epoch, lr,
                             recent_losses, keep_dir=[None], voice_means=None,
-                            epoch_micro_batches=None, optimizer=None, data_generator=None):
+                            epoch_micro_batches=None, optimizer=None, data_generator=None,
+                            keep_all=False):
     """Write the raw model state plus the JSON a resume needs, atomically.
 
     DELIBERATELY NOT THE EXPORT PATH. The exported checkpoint is produced by a
@@ -150,7 +151,9 @@ THE SAME DRAW, WHERE IT CAN BE (resume_position.py). Beside the weights it recor
         except Exception as exc:                                  # never fatal
             print(f"RESUME_CKPT push failed, keeping local copy: {exc}", flush=True)
 
-    if keep_dir[0] and keep_dir[0] != final:
+    # keep_all (--keep_step_checkpoints): every step-<N> stays, so a scorer can read them after the run
+    # (src/score_checkpoints.py). The default keeps only the newest: each one is a whole model.
+    if keep_dir[0] and keep_dir[0] != final and not keep_all:
         shutil.rmtree(keep_dir[0], ignore_errors=True)
     keep_dir[0] = final
     return final
@@ -540,6 +543,10 @@ def train():
                              "and skip injecting a speaker embedding. Use this for a "
                              "checkpoint that will be --init_model_path for a further "
                              "training stage.")
+    parser.add_argument("--keep_step_checkpoints", action="store_true",
+                        help="keep every step-<N> written by --checkpoint_every_steps instead of "
+                             "only the newest, so they can be scored after the run "
+                             "(src/score_checkpoints.py). Each one is a whole model: budget the disk.")
     parser.add_argument("--checkpoint_every_steps", type=int, default=0,
                         help="write a RESUME checkpoint every N optimiser steps, 0 to "
                              "disable. This is NOT the exported artifact: it is the raw "
@@ -1449,6 +1456,7 @@ def train():
                                 epoch_micro_batches=step + 1,
                                 optimizer=None if args.full_ft else optimizer,
                                 data_generator=_data_gen,
+                                keep_all=args.keep_step_checkpoints,
                                 voice_means=voice_means)
                         # EXP-013. Nothing in this trainer measured how long a step
                         # takes, so a throughput question could only be answered by

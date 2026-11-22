@@ -209,3 +209,22 @@ stories = []                               # text ids from eval_prose, in page o
 max_chars = 0                              # 0 = cut at paragraph ends only
 blind = true
 two_recognisers = true                     # final pages: redraw chunks both recognisers hear losing text
+
+# ---------------------------------------------------------------------------------------------------- scoring
+[score]
+# `recipe.py score`: every saved step-<N> of a phase (and its final_merged) scored AFTER training, from disk
+# (src/score_checkpoints.py). Training is never paused for it, and it refuses while a trainer process runs. The
+# trainer keeps only the newest step-<N> unless you add "--keep_step_checkpoints" to the phase's arguments (each one
+# is a whole model, so budget the disk). Every checkpoint renders the same lines at the same seeds through GGUF, is
+# judged by Qwen3-ASR, and gets CER and the runaway, silence and skipped-text rates, each with the no-op floor beside
+# it (one checkpoint scored twice). The measures report; they never choose a checkpoint.
+phase = "lang"                             # lang or spk: which phase's resume/ directory
+lines = "eval_lines"                       # the [paths] entry holding the lines, JSONL {"digest", "text"}; this
+                                           # repository ships no text, so the lines are yours
+speaker = "hk_voice_343"                   # the voice every checkpoint renders with
+bake = { hk_voice_343 = 3000 }             # baked from [paths].voice_source into a scoring copy (never the training
+                                           # output); {} when the checkpoints already carry the speaker
+draws = 1
+floor_mode = "reseed"                      # reseed: the floor is draw-to-draw noise; repeat: same seeds (reads 0 on GGUF)
+scorer = ""                                # optional "module:function" adding measures; empty = none, nothing imported
+rules = { runaway_s_per_char = 0.6, silence_speech_s = 0.3, silence_rms = 0.003, skip_min_run = 4 }

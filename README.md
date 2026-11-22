@@ -142,6 +142,7 @@ python recipe.py render                            # 7a  (GPU)
 python recipe.py gate                              # 7b  (GPU: Qwen3-ASR, the aligner)
 python recipe.py card                              # 7c  (GPU: SenseVoice, ECAPA)
 python recipe.py pages                             # 8   (GPU: the redraw)
+python recipe.py score                             # any time after 4a or 4b: the saved checkpoints, scored
 ```
 
 Add `--dry-run` to any stage to print what it would run. Every stage writes `$RECIPE_WORK/records/<stage>.json`
@@ -240,6 +241,31 @@ OBJECTIVELY_BETTER.
 **Not run here**: Sidon, the codec, training, conversion, rendering, ASR, alignment, or any page with real audio.
 The recipe has not yet produced a model. Acceptance (the lab's TASK-RECIPE-RELEASE-001) is a from-scratch run of these
 commands that passes the gate and the owner's listen.
+
+## Scoring saved checkpoints
+
+`recipe.py score` (`src/score_checkpoints.py`, settings in `[score]`) scores every `step-<N>` a phase saved, and its
+`final_merged`, **after** training, from disk. Training is never paused for it: a paused and resumed full fine-tune
+is not the same run, and a render beside training slows a 12 GB card's steps about threefold. It refuses while a
+trainer process is running (`--beside-training` overrides and is recorded). The trainer keeps only the newest
+`step-<N>` unless the phase is given `--keep_step_checkpoints`; each one is a whole model, so budget the disk.
+
+Each checkpoint is refused by name if it is missing or partial (an unfinished `step-<N>.tmp`, no `resume_state.json`,
+a truncated weights file); otherwise its weights are written over a copy of the model the phase started from (LoRA
+folded in, every key and dtype checked), a fixed voice is baked into that copy if `[score].bake` names one, and it is
+converted to GGUF and renders your lines (`[score].lines`, JSONL `{"digest", "text"}`) at the same per-clip seeds as
+`render`. Qwen3-ASR then judges every clip. Per checkpoint it writes CER (mean, median) and the runaway, silence and
+skipped-text rates to `$RECIPE_WORK/scores/<phase>/summary.json` and to MLflow (`scores/<phase>/mlflow.db`, step N).
+The backend is recorded on every clip, and a run mixing backends is refused.
+
+**The no-op floor.** One checkpoint (the last, by default) is scored twice, and the difference between the two
+scorings is reported beside every reading (`<measure>_floor` in MLflow). `floor_mode = "reseed"` renders the second
+scoring at fresh seeds, so the floor is draw-to-draw noise; `"repeat"` uses the same seeds and reads zero on GGUF. A
+difference between checkpoints inside the floor means nothing.
+
+**An extra scorer** is `[score].scorer = "module:function"` (or `--scorer`): imported only when set, called once per
+scoring with the clips and their transcripts, its numbers logged as `hook/<name>` with their floor. The measures,
+yours included, report; they never choose a checkpoint. `python src/test_score_checkpoints.py` is the CPU test.
 
 ## Story render checks
 
