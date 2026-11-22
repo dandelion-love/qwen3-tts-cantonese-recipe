@@ -85,6 +85,26 @@ whole clauses, 45 do not; zh-HK adds Hong Kong speech to a `yue` pool drawn from
 (in one early selection only 3.9% of clips were labelled Hong Kong). zh-HK is a language set, so it is trimmed and
 not padded.
 
+### Full fine-tuning on a 12 GB card
+
+The release recipe trains LoRA. The trainer also runs a full fine-tune (`--full_ft`, with `--full_ft_scope` and
+`--full_ft_precision`), and two options exist to fit the 0.6B base on a 12 GB card:
+
+- `--full_ft_optimizer adamw8bit` stores both AdamW moments as 8-bit blockwise codes (bitsandbytes `AdamW8bit`).
+  With `--full_ft_precision bf16_master_fp32` the weights stay bf16, the masters fp32, and only the moments are
+  8-bit; with `--offload_master` the masters and that 8-bit state live in host RAM. Install it with
+  `pip install -r requirements-8bit.txt` (bitsandbytes 0.50.2, which leaves torch 2.4.1 as it is). Without
+  bitsandbytes the trainer refuses; it never falls back to fp32 moments.
+- `--freeze_text_embedding` keeps the talker's text embedding table (151,936 x 2,048 = 311.2M parameters on the
+  0.6B base) frozen: no gradient, no optimizer state, no master, and the checkpoint carries it unchanged.
+
+Per trainable parameter that is about 10 bytes (bf16 weight and gradient, fp32 master, 8-bit moments) against 16
+with fp32 moments. The measured peak memory and step time on a 12 GB card are not recorded here yet; this section
+gets that table when they are. `python trainer/test_full_ft_optim.py` checks both options on a tiny model on CPU
+(`FULLFT_TEST_DEVICE=cuda` runs the same steps on the GPU). Since these options, the trainer differs from the one
+that trained the release by more than the argument guard named under "What was checked"; the LoRA path is
+unchanged (it builds the same `AdamW`).
+
 ## Where the v0.0.5 build's data starts
 
 The owner's decision for the from-scratch build (2026-10-22): **"Start from the raw clips on disk."** Two of the three

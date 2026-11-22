@@ -184,8 +184,13 @@ def full_ft_state_dict(module):
     return out
 
 
-class MasterWeightAdamW(AdamW):
+class _MasterWeights:
     """AdamW over fp32 master copies of bf16 parameters.
+
+    A mixin since --full_ft_optimizer: the concrete classes below put it in front
+    of torch's AdamW (MasterWeightAdamW) or bitsandbytes' AdamW8bit
+    (master_weight_adamw8bit_class), and every super() call here reaches that
+    optimizer. Everything this docstring says about the masters holds for both.
 
     This is not a refinement, it is a correctness fix, and the measurement is
     worth keeping because it is invisible in every other way.
@@ -248,6 +253,10 @@ class MasterWeightAdamW(AdamW):
     needs no change to the training loop at all.
     """
 
+    # torch's AdamW takes `foreach`; bitsandbytes' AdamW8bit does not (it has no
+    # multi-tensor path, so the copy the comment below avoids never exists there).
+    _accepts_foreach = True
+
     def __init__(self, param_groups, **kwargs):
         # Pair each live model parameter with an fp32 shadow. AdamW is given the
         # shadows, so its state -- and therefore its arithmetic -- is fp32
@@ -274,7 +283,8 @@ class MasterWeightAdamW(AdamW):
         # The single-tensor loop is slower per step by a fraction of a second, over
         # the ~86 optimiser steps a 343-clip speaker phase runs. setdefault, not a
         # hard assignment, so a caller with room to spare can still ask for it.
-        kwargs.setdefault("foreach", False)
+        if self._accepts_foreach:
+            kwargs.setdefault("foreach", False)
         self._pairs = []
         shadow_groups = []
         for group in param_groups:
@@ -365,6 +375,114 @@ class MasterWeightAdamW(AdamW):
                     p.grad = None
                 else:
                     p.grad.zero_()
+
+
+class MasterWeightAdamW(_MasterWeights, AdamW):
+    """fp32 masters and fp32 AdamW moments: --full_ft_optimizer adamw."""
+
+
+# === 8-bit AdamW (--full_ft_optimizer adamw8bit) ===
+# Tested with bitsandbytes 0.50.2 (requirements-8bit.txt) on torch 2.4.1 + cu121,
+# whose wheel ships CUDA 11.8 to 13.x kernels and a CPU kernel for the 8-bit update.
+BITSANDBYTES_PIN = "0.50.2"
+
+
+class MissingBitsandbytes(RuntimeError):
+    """--full_ft_optimizer adamw8bit was asked for and bitsandbytes is not importable."""
+
+
+def require_bitsandbytes():
+    """The bitsandbytes module, or MissingBitsandbytes naming the fix.
+
+    Never a fallback to fp32 AdamW: the 8-bit optimizer is chosen because fp32
+    moments do not fit the card, so quietly training with them would either OOM
+    an hour in or, worse, fit on a bigger card and be recorded as an 8-bit run.
+    """
+    try:
+        import bitsandbytes
+    except ImportError as exc:
+        raise MissingBitsandbytes(
+            "--full_ft_optimizer adamw8bit needs bitsandbytes, which is not importable "
+            f"({exc}). Install it with `pip install -r requirements-8bit.txt` "
+            f"(bitsandbytes=={BITSANDBYTES_PIN}), or train with --full_ft_optimizer adamw. "
+            "There is no fallback.") from exc
+    return bitsandbytes
+
+
+def master_weight_adamw8bit_class():
+    """bf16 model weights, fp32 masters, 8-bit AdamW moments.
+
+    bitsandbytes' AdamW8bit is given the fp32 masters as its parameters, exactly
+    as torch's AdamW is in MasterWeightAdamW, so the update arithmetic and the
+    weight it accumulates into are fp32 and only the two moments are stored as
+    8-bit blockwise-quantised codes (state1/state2 uint8, one fp32 absmax per
+    2048-value block, plus a 256-entry fp32 code map each). Per trainable
+    parameter: 2 bytes bf16 weight + 2 bf16 grad + 4 fp32 master + ~2 moments,
+    against 2 + 2 + 4 + 8 with fp32 moments.
+
+    Two bitsandbytes behaviours this inherits, both deliberate on its side:
+    a tensor with fewer than 4096 elements (min_8bit_size: norms, biases) keeps
+    fp32 moments; and its default percentile_clipping=100 means no gradient
+    clipping of its own.
+
+    With --offload_master the masters, and therefore the 8-bit state that
+    bitsandbytes allocates beside them, live in host RAM and the update runs on
+    bitsandbytes' CPU kernel. That combination is functional (the CPU test runs
+    it); its step time is not measured here.
+    """
+    bnb = require_bitsandbytes()
+
+    class MasterWeightAdamW8bit(_MasterWeights, bnb.optim.AdamW8bit):
+        _accepts_foreach = False
+
+    return MasterWeightAdamW8bit
+
+
+def make_full_ft_optimizer(groups, *, lr, weight_decay=0.01, eightbit=False,
+                           masters=False, offload_master=False):
+    """The optimizer for the trainer's parameter groups.
+
+    masters=False: the optimizer steps the model's own parameters (fp32 or plain
+    bf16 precision). masters=True: MasterWeightAdamW or its 8-bit twin. eightbit
+    raises MissingBitsandbytes rather than returning an fp32 AdamW.
+    """
+    if masters:
+        cls = master_weight_adamw8bit_class() if eightbit else MasterWeightAdamW
+        return cls(groups, lr=lr, weight_decay=weight_decay,
+                   offload_master=offload_master)
+    if offload_master:
+        raise ValueError("offload_master needs the fp32 masters it offloads")
+    if eightbit:
+        return require_bitsandbytes().optim.AdamW8bit(groups, lr=lr, weight_decay=weight_decay)
+    return AdamW(groups, lr=lr, weight_decay=weight_decay)
+
+
+TEXT_EMBEDDING_PARAM = "talker.model.text_embedding.weight"
+
+
+def freeze_text_embedding(model):
+    """Freeze the talker's text embedding table; return how many parameters that removed.
+
+    The table is text_vocab_size x text_hidden_size (151,936 x 2,048 = 311.2M on
+    the 0.6B base), a third of that model, and every row a training set never
+    contains receives no gradient anyway. Frozen, it is left out of the optimizer
+    and its masters because the trainer builds both from requires_grad, and the
+    checkpoint carries it unchanged. The text projection that follows it still
+    trains. It must not share storage with another parameter, or freezing it would
+    freeze that one too; that is checked, not assumed.
+    """
+    named = dict(model.named_parameters(remove_duplicate=False))
+    if TEXT_EMBEDDING_PARAM not in named:
+        raise RuntimeError(f"{TEXT_EMBEDDING_PARAM} not found; the model layout has changed")
+    emb = named[TEXT_EMBEDDING_PARAM]
+    shared = [n for n, p in named.items()
+              if n != TEXT_EMBEDDING_PARAM and p.data_ptr() == emb.data_ptr()]
+    if shared:
+        raise RuntimeError(f"{TEXT_EMBEDDING_PARAM} shares storage with {shared}; "
+                           "freezing it would freeze those too")
+    was = emb.requires_grad
+    emb.requires_grad_(False)
+    return emb.numel() if was else 0
 
 
 def apply_full_ft_scope(model, scope):
@@ -510,6 +628,20 @@ def train():
                              "memory, the workstation lane). 'bf16' is a measured "
                              "no-op below lr 1e-4 -- 3.9%% of weights move at 2e-6 "
                              "-- and exists only to reproduce that finding.")
+    parser.add_argument("--full_ft_optimizer", type=str, default="adamw",
+                        choices=["adamw", "adamw8bit"],
+                        help="--full_ft only. 'adamw' keeps fp32 moments. 'adamw8bit' "
+                             "stores both AdamW moments as 8-bit blockwise codes "
+                             "(bitsandbytes AdamW8bit; pip install -r "
+                             "requirements-8bit.txt). With bf16_master_fp32 it steps "
+                             "the fp32 masters, so the weights are bf16, the masters "
+                             "fp32 and only the moments 8-bit. Refuses when "
+                             "bitsandbytes is missing; never falls back.")
+    parser.add_argument("--freeze_text_embedding", action="store_true",
+                        help="--full_ft only. Keep the talker's text embedding table "
+                             "(151,936 x 2,048 on the 0.6B base) frozen: no gradient, "
+                             "no optimizer state, no master, saved unchanged. A no-op "
+                             "under --full_ft_scope code_predictor, which never trains it.")
     parser.add_argument("--code_predictor_lr_scale", type=float, default=1.0,
                         help="With --lora_include_code_predictor, train the code "
                              "predictor's adapters at lr * this. The codec head is "
@@ -629,14 +761,28 @@ def train():
         torch.backends.cuda.enable_flash_sdp(False)
         torch.backends.cuda.enable_mem_efficient_sdp(False)
         torch.backends.cuda.enable_math_sdp(True)
-    # THE RECIPE REPOSITORY TRAINS LoRA SFT ONLY. This file is the lab's trainer unchanged apart from this guard:
-    # it is the one module whose pruning could not be checked here without a GPU run, so its full-fine-tune and
-    # preference (DPO) paths stay in the source, unreachable. Their helper modules (preference_*.py) are not shipped,
-    # so the flags are refused here, before anything loads, rather than failing on an import halfway into a run.
-    for _flag, _on in (("--full_ft", args.full_ft), ("--hybrid_code_predictor", args.hybrid_code_predictor),
-                       ("--offload_master", args.offload_master), ("--preference_jsonl", bool(args.preference_jsonl))):
+    # THE RECIPE TRAINS LoRA SFT AND FULL FINE-TUNING. The hybrid and preference (DPO) paths stay in the source,
+    # unreachable: the preference helper modules (preference_*.py) are not shipped, so those flags are refused here,
+    # before anything loads, rather than failing on an import halfway into a run. --full_ft and --offload_master
+    # import nothing the recipe lacks; they were refused until 8-bit AdamW and the frozen text embedding made a
+    # full fine-tune of the 0.6B base a 12 GB configuration.
+    for _flag, _on in (("--hybrid_code_predictor", args.hybrid_code_predictor),
+                       ("--preference_jsonl", bool(args.preference_jsonl))):
         if _on:
-            parser.error(f"{_flag} is not part of the recipe (LoRA SFT only); it lives in the lab's trainer")
+            parser.error(f"{_flag} is not part of the recipe (LoRA SFT and --full_ft only)")
+    if not args.full_ft:
+        if args.full_ft_optimizer != "adamw":
+            parser.error("--full_ft_optimizer applies to --full_ft only; the LoRA path keeps its AdamW")
+        if args.freeze_text_embedding:
+            parser.error("--freeze_text_embedding applies to --full_ft only; LoRA never trains that table")
+    elif args.full_ft_optimizer == "adamw8bit":
+        try:
+            require_bitsandbytes()
+        except MissingBitsandbytes as exc:
+            parser.error(str(exc))
+    if args.offload_master and not (args.full_ft and args.full_ft_precision == "bf16_master_fp32"):
+        parser.error("--offload_master moves the fp32 masters to host RAM; it needs --full_ft "
+                     "--full_ft_precision bf16_master_fp32, which is the only recipe path that has them")
     if getattr(args, "hybrid_code_predictor", False) and args.full_ft:
         parser.error("--hybrid_code_predictor and --full_ft are mutually exclusive: "
                      "hybrid IS the LoRA path with the code predictor additionally "
@@ -753,7 +899,9 @@ def train():
                   else args.speaker_name)
     if args.full_ft:
         run_name = (f"fullft-{args.full_ft_scope}-{args.full_ft_precision}"
-                    f"-{_voice_tag}-bs{args.batch_size}-lr{args.lr:g}")
+                    + ("-adamw8bit" if args.full_ft_optimizer == "adamw8bit" else "")
+                    + ("-frozentext" if args.freeze_text_embedding else "")
+                    + f"-{_voice_tag}-bs{args.batch_size}-lr{args.lr:g}")
     else:
         run_name = (f"lora-r{args.lora_rank}-{_voice_tag}"
                     f"-bs{args.batch_size}-warmup{args.warmup_ratio}")
@@ -837,6 +985,15 @@ def train():
             # checkpoint have identical keys by construction.
             train_model = qwen3tts.model
             n_train, n_total = apply_full_ft_scope(train_model, args.full_ft_scope)
+            n_text_frozen = 0
+            if args.freeze_text_embedding:
+                n_text_frozen = freeze_text_embedding(train_model)
+                n_train -= n_text_frozen
+                if accelerator.is_main_process:
+                    accelerator.print(
+                        f"FROZEN text embedding: {n_text_frozen:,} parameters "
+                        + ("" if n_text_frozen else
+                           "(already frozen by --full_ft_scope; no change)"))
             if accelerator.is_main_process:
                 accelerator.print(
                     f"FULL FINE-TUNE | scope={args.full_ft_scope} "
@@ -858,6 +1015,7 @@ def train():
                     "full_ft_trainable_params": n_train,
                     "full_ft_total_params": n_total,
                     "full_ft_load_dtype": str(load_dtype),
+                    "full_ft_text_embedding_frozen_params": n_text_frozen,
                 })
         else:
             train_model = get_peft_model(qwen3tts.model, lora_config)
@@ -1070,9 +1228,12 @@ def train():
         # wearing a convincing curve. The LoRA-only path is untouched: `cp` is empty
         # there, so this branch cannot fire.
         needs_master = (args.full_ft and args.full_ft_precision == "bf16_master_fp32")             or (getattr(args, "hybrid_code_predictor", False) and cp)
+        # --full_ft_optimizer adamw8bit swaps in bitsandbytes' AdamW8bit on either
+        # branch; with masters it steps the fp32 shadows (make_full_ft_optimizer).
+        eightbit = args.full_ft and args.full_ft_optimizer == "adamw8bit"
         if needs_master:
-            optimizer = MasterWeightAdamW(
-                groups, lr=args.lr, weight_decay=0.01,
+            optimizer = make_full_ft_optimizer(
+                groups, lr=args.lr, weight_decay=0.01, eightbit=eightbit, masters=True,
                 offload_master=getattr(args, "offload_master", False))
             if getattr(args, "offload_master", False) and accelerator.is_main_process:
                 # EXP-013 names a void condition for exactly this: "the offload arm
@@ -1083,10 +1244,12 @@ def train():
                                   f"{len(optimizer._pairs)} tensors")
                 assert devs == {"cpu"}, f"offload requested but masters on {devs}"
         else:
-            optimizer = AdamW(groups, lr=args.lr, weight_decay=0.01)
+            optimizer = make_full_ft_optimizer(groups, lr=args.lr, weight_decay=0.01,
+                                               eightbit=eightbit)
         if accelerator.is_main_process:
             accelerator.print(
-                f"optimizer groups: talker={len(rest)} params @ {args.lr:g}"
+                f"optimizer: {type(optimizer).__name__} | "
+                f"groups: talker={len(rest)} params @ {args.lr:g}"
                 + (f", code_predictor={len(cp)} params @ "
                    f"{args.lr * args.code_predictor_lr_scale:g}" if cp else
                    ", code_predictor excluded"))

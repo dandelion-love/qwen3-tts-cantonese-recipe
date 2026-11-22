@@ -1,0 +1,4 @@
+# Optional: 8-bit AdamW for full fine-tuning (trainer --full_ft_optimizer adamw8bit). Install after requirements.txt.
+# 0.50.2 installs beside torch 2.4.1 without changing it, ships CUDA 11.8 to 13.x kernels (cu121 among them),
+# and has a CPU kernel for the 8-bit update, which trainer/test_full_ft_optim.py runs.
+bitsandbytes==0.50.2
