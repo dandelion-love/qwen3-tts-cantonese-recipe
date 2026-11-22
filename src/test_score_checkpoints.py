@@ -418,7 +418,10 @@ def test_scoring_copy_only(td: Path):
     write_st(lang / "model.safetensors", {"w": torch.ones(1)})
     converted = []
 
-    def fake_bake(target, source, voices):
+    bakes = []
+
+    def fake_bake(target, source, voices, **kw):
+        bakes.append(kw)
         cfg = json.loads((target / "config.json").read_text())
         cfg["talker_config"]["spk_id"] = voices
         (target / "config.json").write_text(json.dumps(cfg))
@@ -443,6 +446,16 @@ def test_scoring_copy_only(td: Path):
         (spk / "config.json").write_text('{"tts_model_type": "custom_voice", "talker_config": {"spk_id": {"v": 3000}}}')
         g, copy = sc.prepare_gguf({"label": "spkfinal", "path": spk, "step": None, "kind": "export"}, a)
         check("an export carrying the voice is converted as it is, with no copy", copy is None and converted[-1] == spk)
+        check("the bake gets the 1b7 default size and no clips", bakes[0].get("model_size") == "1b7"
+              and not bakes[0].get("audio"))
+        a = sc.parser().parse_args(["--lines", "x", "--out", str(td / "copy" / "out"), "--speaker", "v",
+                                    "--bake", "v=3000", "--model-size", "0b6", "--init", str(td / "init"),
+                                    "--voice-audio", "v=/clips/a,b.flac", "--voice-audio", "v=/clips/c.flac"])
+        a.key_prefix = "k"
+        sc.prepare_gguf({"label": "final6", "path": lang, "step": None, "kind": "export"}, a)
+        check("a 0b6 setting reaches the bake, with each clip and --init as the encoder",
+              bakes[-1] == {"model_size": "0b6", "encoder": td / "init",
+                            "audio": {"v": ["/clips/a,b.flac", "/clips/c.flac"]}})
     finally:
         for k, v in saved.items():
             if v is None:

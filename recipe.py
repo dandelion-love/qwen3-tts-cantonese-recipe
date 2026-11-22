@@ -609,7 +609,12 @@ def stage_score(r: Recipe) -> None:
            s["floor_mode"], "--rules", json.dumps(s["rules"]), "--lora-rank", t["lora_rank"], "--lora-alpha",
            t["lora_alpha"], "--quant", r.cfg["convert"]["quant"]]
     cmd += [x for n, row in s["bake"].items() for x in ("--bake", f"{n}={row}")]
-    cmd += ["--voice-source", r.path("voice_source")] if s["bake"] else []
+    cmd += ["--model-size", model_size(r)]
+    if s["bake"]:                      # the voice source and clips as `recipe.py bake` gives them (bake_command)
+        audio = {n: c for n, c in voice_audio(r).items() if n in s["bake"]}
+        if r.paths.get("voice_source") or set(s["bake"]) - set(audio):
+            cmd += ["--voice-source", r.path("voice_source")]
+        cmd += [f"--voice-audio={n}={clip}" for n, clips in audio.items() for clip in clips]
     cmd += ["--checkpoint", run / "final_merged"] if r.dry or (run / "final_merged").is_dir() else []
     r.run("score", cmd + (["--scorer", s["scorer"]] if s["scorer"] else []))
     r.record("score", {"summary": str(out / "summary.json"), "phase": s["phase"], "scorer": s["scorer"] or None})

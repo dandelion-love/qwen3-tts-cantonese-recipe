@@ -149,6 +149,27 @@ class ModelSizeTests(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("--encoder") + 1], str(self.work / "train" / "lang" / "final_merged"))
         self.assertIn("--voice-audio=hk_voice_343=/clips/a.flac", cmd)
 
+    def score_cmd(self, r):
+        with mock.patch.object(recipe.Recipe, "run") as run, mock.patch.object(recipe.Recipe, "record"):
+            recipe.stage_score(r)
+        return [str(c) for c in run.call_args[0][1]]
+
+    def test_score_passes_the_size_and_clips_to_its_bake(self):
+        r = make_recipe(self.work, train={"model_size": "0b6"}, paths={"voice_source": ""},
+                        bake={"voices": {"hk_voice_343": 3000}, "voice_audio": {"hk_voice_343": ["/clips/a.flac"]}})
+        r.dry = True                                   # placeholders for the unset paths; run is mocked anyway
+        cmd = self.score_cmd(r)
+        self.assertEqual(cmd[cmd.index("--model-size") + 1], "0b6")
+        self.assertIn("--voice-audio=hk_voice_343=/clips/a.flac", cmd)
+        self.assertNotIn("--voice-source", cmd)
+
+    def test_score_default_is_1b7_from_the_voice_source(self):
+        r = make_recipe(self.work, train={}, paths={"voice_source": str(self.work / "release")})
+        r.dry = True
+        cmd = self.score_cmd(r)
+        self.assertEqual(cmd[cmd.index("--model-size") + 1], "1b7")
+        self.assertEqual(cmd[cmd.index("--voice-source") + 1], str(self.work / "release"))
+
     def test_bake_command_default_is_the_1b7_copy(self):
         r = make_recipe(self.work, train={}, paths={"voice_source": str(self.work / "release")})
         cmd = [str(c) for c in recipe.bake_command(r)]
