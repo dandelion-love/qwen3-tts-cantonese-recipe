@@ -154,6 +154,8 @@ seed = 1
 fast_kernels = false                     # true: seeded but fast GPU kernels (about 0.0005 apart after 30 steps instead of 0.0); for exploration only, a release trains exact
 language_extra = ["--keep_speaker_encoder"]          # from the public base; the speaker phase needs the encoder
 speaker_name = "hk_voice_343"                        # one voice per speaker phase, baked at row 3000
+speaker_extra = []                                   # more trainer arguments for the speaker phase only, e.g.
+                                                     # ["--keep_step_checkpoints"] to score its steps
 min_free_mib = 10000                                 # refuse to start on a card with less free memory
 
 # ---------------------------------------------------------------------------------------------------- 5. voices
@@ -214,11 +216,17 @@ two_recognisers = true                     # final pages: redraw chunks both rec
 [score]
 # `recipe.py score`: every saved step-<N> of a phase (and its final_merged) scored AFTER training, from disk
 # (src/score_checkpoints.py). Training is never paused for it, and it refuses while a trainer process runs. The
-# trainer keeps only the newest step-<N> unless you add "--keep_step_checkpoints" to the phase's arguments (each one
-# is a whole model, so budget the disk). Every checkpoint renders the same lines at the same seeds through GGUF, is
-# judged by Qwen3-ASR, and gets CER and the runaway, silence and skipped-text rates, each with the no-op floor beside
-# it (one checkpoint scored twice). The measures report; they never choose a checkpoint.
-phase = "lang"                             # lang or spk: which phase's resume/ directory
+# trainer keeps only the newest step-<N> unless the phase is given "--keep_step_checkpoints" ([train].language_extra
+# or speaker_extra; each one is a whole model, so budget the disk: the stage prints each checkpoint's size and the
+# total before it starts). The untrained model the phase started from is scored first as the step-0 "base" row, and
+# every reading carries its difference from it. Every checkpoint renders the same lines at the same seeds through
+# GGUF, is judged by Qwen3-ASR on the release gate's script fold (OpenCC required), and gets CER and the runaway,
+# silence and skipped-text rates, each with the no-op floor beside it (one checkpoint scored twice). A copy that is
+# scored with a voice is marked custom_voice in that copy only. The rules are uncalibrated, and the measures report;
+# they never choose a checkpoint.
+phase = "lang"                             # lang: steps in the [score].bake voice; spk: steps in their own voice (the
+                                           # running mean each step saved, at row 3000 as [train].speaker_name), and the
+                                           # base row (lang final_merged) in the [score].bake voice
 lines = "eval_lines"                       # the [paths] entry holding the lines, JSONL {"digest", "text"}; this
                                            # repository ships no text, so the lines are yours
 speaker = "hk_voice_343"                   # the voice every checkpoint renders with

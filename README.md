@@ -247,15 +247,20 @@ commands that passes the gate and the owner's listen.
 `recipe.py score` (`src/score_checkpoints.py`, settings in `[score]`) scores every `step-<N>` a phase saved, and its
 `final_merged`, **after** training, from disk. Training is never paused for it: a paused and resumed full fine-tune
 is not the same run, and a render beside training slows a 12 GB card's steps about threefold. It refuses while a
-trainer process is running (`--beside-training` overrides and is recorded). The trainer keeps only the newest
-`step-<N>` unless the phase is given `--keep_step_checkpoints`; each one is a whole model, so budget the disk.
+trainer process is running on this host (`--beside-training` overrides and is recorded; it cannot see a trainer in
+another OS or VM, or another GPU job). The trainer keeps only the newest `step-<N>` unless the phase is given
+`--keep_step_checkpoints` (`[train].language_extra` or `speaker_extra`); each one is a whole model, so budget the
+disk: the stage prints each checkpoint's size and the total first.
 
 Each checkpoint is refused by name if it is missing or partial (an unfinished `step-<N>.tmp`, no `resume_state.json`,
 a truncated weights file); otherwise its weights are written over a copy of the model the phase started from (LoRA
 folded in, every key and dtype checked), a fixed voice is baked into that copy if `[score].bake` names one, and it is
 converted to GGUF and renders your lines (`[score].lines`, JSONL `{"digest", "text"}`) at the same per-clip seeds as
-`render`. Qwen3-ASR then judges every clip. Per checkpoint it writes CER (mean, median) and the runaway, silence and
-skipped-text rates to `$RECIPE_WORK/scores/<phase>/summary.json` and to MLflow (`scores/<phase>/mlflow.db`, step N).
+`render`. A speaker phase's steps are scored in their own voice (the running mean each step saved); a copy given a
+voice is marked `custom_voice` in that copy only. The untrained starting model is scored first as the step-0 `base`
+row, and every reading carries its difference from it. Qwen3-ASR then judges every clip, on the release gate's
+script fold (OpenCC required). Per checkpoint it writes CER (mean, median) and the runaway, silence and skipped-text
+rates (uncalibrated thresholds, so read them against the base row) to `$RECIPE_WORK/scores/<phase>/summary.json` and to MLflow (`scores/<phase>/mlflow.db`, step N).
 The backend is recorded on every clip, and a run mixing backends is refused.
 
 **The no-op floor.** One checkpoint (the last, by default) is scored twice, and the difference between the two

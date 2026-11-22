@@ -393,7 +393,7 @@ def stage_train_lang(r: Recipe) -> None:
 def stage_train_spk(r: Recipe) -> None:
     name = r.cfg["train"]["speaker_name"]
     rec = train(r, "spk", r.work / "train" / "lang" / "final_merged",
-                r.work / "sets" / r.cfg["sets"]["train"]["speaker"]["file"], ["--speaker_name", name])
+                r.work / "sets" / r.cfg["sets"]["train"]["speaker"]["file"], ["--speaker_name", name, *r.cfg["train"].get("speaker_extra", [])])
     if not r.dry and rec["spk_id"] != {name: 3000}:
         raise SystemExit(f"the speaker phase exported spk_id {rec['spk_id']}, not {{{name!r}: 3000}}")
     r.record("train-spk", rec)
@@ -544,11 +544,13 @@ def stage_pages(r: Recipe) -> None:
 def stage_score(r: Recipe) -> None:
     """Every saved step-<N> of [score].phase (and its final_merged), scored after training (src/score_checkpoints.py)."""
     s, t = r.cfg["score"], r.cfg["train"]
+    spk = s["phase"] == "spk"            # a speaker phase's steps are scored in their own voice (their running mean)
     run = r.work / "train" / s["phase"]
-    init = r.path("base_model") if s["phase"] == "lang" else r.work / "train" / "lang" / "final_merged"
+    init = r.work / "train" / "lang" / "final_merged" if spk else r.path("base_model")
     out = r.work / "scores" / s["phase"]
     cmd = [r.py, SRC / "score_checkpoints.py", "--checkpoints", run / "resume", "--init", init, "--lines",
-           r.path(s["lines"]), "--out", out, "--speaker", s["speaker"], "--draws", s["draws"], "--floor-mode",
+           r.path(s["lines"]), "--out", out, "--speaker", t["speaker_name"] if spk else s["speaker"],
+           *(["--own-voice", f"{t['speaker_name']}=3000"] if spk else []), "--draws", s["draws"], "--floor-mode",
            s["floor_mode"], "--rules", json.dumps(s["rules"]), "--lora-rank", t["lora_rank"], "--lora-alpha",
            t["lora_alpha"], "--quant", r.cfg["convert"]["quant"]]
     cmd += [x for n, row in s["bake"].items() for x in ("--bake", f"{n}={row}")]
