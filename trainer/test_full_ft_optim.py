@@ -15,6 +15,8 @@ What it checks:
   "changed" is not an artefact of the harness. Its update tracks fp32 AdamW's (cosine > 0.9).
 - The frozen text embedding stays bit-identical through 20 steps and through the bf16 checkpoint cast while every
   other tensor moves, holds no optimizer state and no master; without the freeze the same run moves it (the plant).
+- A resume re-seeds the fp32 masters from the resumed weights, so the next step continues from them (without the
+  re-seed, the plant, the step writes the pre-resume masters back), for both optimizers, offloaded or not.
 - A missing bitsandbytes refuses, from the factory and from the command line, and never falls back to fp32 AdamW.
 
 What it is not: the 0.6B model. Its memory and step time on a 12 GB card are a separate GPU measurement.
@@ -269,6 +271,65 @@ class MissingBitsandbytesRefuses(unittest.TestCase):
         self.assertIn("bf16_master_fp32", err)
 
 
+class ResumeReseedsMasters(unittest.TestCase):
+    """The trainer's resume order: optimizer built (masters cloned), then resumed weights loaded, then a step.
+
+    With the re-seed the step continues from the resumed weights; without it (the plant) the step writes the
+    pre-resume masters back and the resume is undone.
+    """
+
+    NAME = "talker.text_projection.weight"
+
+    def _resume(self, *, eightbit, offload, reseed):
+        model = _model(torch.bfloat16)
+        T.apply_full_ft_scope(model, "all")
+        groups = _groups(model)
+        for gr in groups:
+            gr["lr"] = 1e-6
+        opt = T.make_full_ft_optimizer(groups, lr=1e-6, weight_decay=0.0, eightbit=eightbit,
+                                       masters=True, offload_master=offload)
+        resumed = {k: (v + 0.5).to(v.dtype) for k, v in model.state_dict().items()}
+        model.load_state_dict(resumed)
+        n = T.reseed_masters(opt) if reseed else 0
+        _train(model, opt, steps=1)
+        w = dict(model.named_parameters())[self.NAME].detach().float()
+        return n, (w - resumed[self.NAME].float()).abs().max().item(), len(opt._pairs)
+
+    def _configs(self):
+        out = [("adamw", False, False), ("adamw offloaded", False, True)]
+        if HAVE_BNB:
+            out += [("adamw8bit", True, False), ("adamw8bit offloaded", True, True)]
+        return out
+
+    def test_step_continues_from_resumed_weights(self):
+        for name, eightbit, offload in self._configs():
+            with self.subTest(name):
+                n, drift, pairs = self._resume(eightbit=eightbit, offload=offload, reseed=True)
+                self.assertEqual(n, pairs)
+                self.assertLess(drift, 0.01, f"{name}: drifted {drift} from the resumed weights")
+
+    def test_plant_without_reseed_the_resume_is_undone(self):
+        for name, eightbit, offload in self._configs():
+            with self.subTest(name):
+                _, drift, _ = self._resume(eightbit=eightbit, offload=offload, reseed=False)
+                self.assertGreater(drift, 0.4, f"{name}: the plant did not show the hazard")
+
+    def test_no_masters_is_a_no_op(self):
+        p = nn.Parameter(torch.zeros(4))
+        self.assertEqual(T.reseed_masters(torch.optim.AdamW([p])), 0)
+
+    def test_not_restored_names_the_state(self):
+        p = nn.Parameter(torch.zeros(8))
+        self.assertIn("exp_avg", T.full_ft_not_restored(torch.optim.AdamW([p])))
+        self.assertIn("masters", T.full_ft_not_restored(
+            T.make_full_ft_optimizer([{"params": [p]}], lr=1e-3, masters=True)))
+        if HAVE_BNB:
+            msg = T.full_ft_not_restored(T.make_full_ft_optimizer([{"params": [p]}], lr=1e-3,
+                                                                  eightbit=True, masters=True))
+            self.assertIn("state1/state2", msg)
+            self.assertIn("masters", msg)
+
+
 class TrainerWiring(unittest.TestCase):
     """The trainer builds its optimizer through make_full_ft_optimizer, and freezes before it groups parameters."""
 
@@ -283,6 +344,15 @@ class TrainerWiring(unittest.TestCase):
         self.assertEqual(src.count("optimizer = make_full_ft_optimizer("), 2)   # masters and plain branches
         self.assertNotIn("optimizer = AdamW(", src)
         self.assertNotIn("optimizer = MasterWeightAdamW(", src)
+
+    def test_resume_reseeds_after_loading(self):
+        src = (HERE / "sft_12hz_lora_mlflow.py").read_text(encoding="utf-8")
+        start = src.find("if args.resume_from:\n            import safetensors.torch")
+        order = ["load_state_dict(", "reseed_masters(optimizer)", "for _ in range(optimizer_steps):"]
+        at = [src.find(s, start) for s in order]
+        self.assertTrue(start >= 0 and all(i > start for i in at), dict(zip(order, at)))
+        self.assertEqual(at, sorted(at))
+        self.assertIn("not_restored=(full_ft_not_restored(optimizer)", src)
 
 
 if __name__ == "__main__":

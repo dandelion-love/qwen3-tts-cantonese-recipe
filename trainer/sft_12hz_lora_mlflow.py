@@ -72,7 +72,7 @@ def clean_merged_state_dict(peft_model):
 def write_resume_checkpoint(out_root, unwrapped, optimizer_steps, epoch, lr,
                             recent_losses, keep_dir=[None], voice_means=None,
                             epoch_micro_batches=None, optimizer=None, data_generator=None,
-                            keep_all=False):
+                            keep_all=False, not_restored=None):
     """Write the raw model state plus the JSON a resume needs, atomically.
 
     DELIBERATELY NOT THE EXPORT PATH. The exported checkpoint is produced by a
@@ -115,7 +115,8 @@ THE SAME DRAW, WHERE IT CAN BE (resume_position.py). Beside the weights it recor
                          + (", optimizer state" if optimizer is not None else "")
                          + (", each voice's running mean and clip count" if voice_means is not None else ""),
              "does_not_restore": ("nothing" if optimizer is not None
-                                  else "AdamW exp_avg/exp_avg_sq, MasterWeightAdamW fp32 masters")}
+                                  else not_restored
+                                  or "AdamW exp_avg/exp_avg_sq, MasterWeightAdamW fp32 masters")}
     if epoch_micro_batches is not None:
         # Inside the atomic rename, like the weights: a resume reads all of it or none.
         state.update(rp.save(tmp, epoch=epoch, micro_batches=epoch_micro_batches,
@@ -375,6 +376,37 @@ class _MasterWeights:
                     p.grad = None
                 else:
                     p.grad.zero_()
+
+
+    @torch.no_grad()
+    def reseed_from_params(self):
+        """Copy every live parameter into its master, in place; return how many.
+
+        For a resume: the masters are cloned when the optimizer is built, which is
+        before the resumed weights are loaded. In place, because self.state is keyed
+        by the master tensor (see _sync_devices). Masters stay on their own device,
+        host RAM under offload.
+        """
+        for p, master in self._pairs:
+            master.data.copy_(p.detach().to(master.device, torch.float32))
+        return len(self._pairs)
+
+
+def reseed_masters(optimizer):
+    """Re-seed the fp32 masters behind `optimizer` (accelerate-wrapped or not); 0 if it has none."""
+    inner = getattr(optimizer, "optimizer", optimizer)
+    return inner.reseed_from_params() if isinstance(inner, _MasterWeights) else 0
+
+
+def full_ft_not_restored(optimizer):
+    """What a full fine-tune's resume checkpoint does not carry, named for this optimizer."""
+    inner = getattr(optimizer, "optimizer", optimizer)
+    eightbit = "8bit" in type(inner).__name__
+    lost = ("AdamW8bit state1/state2 (8-bit moments) and their absmax/qmap" if eightbit
+            else "AdamW exp_avg/exp_avg_sq")
+    if isinstance(inner, _MasterWeights):
+        lost += "; fp32 masters (re-seeded from the saved bf16 weights on resume)"
+    return lost
 
 
 class MasterWeightAdamW(_MasterWeights, AdamW):
@@ -694,7 +726,9 @@ def train():
                              "position, the data position and the RNG states, and for LoRA "
                              "the optimizer state, so with --seed the resumed run is the "
                              "same draw as an uninterrupted one (resume_position.py). A full "
-                             "fine-tune does NOT restore AdamW moments or the fp32 masters "
+                             "fine-tune does NOT restore the AdamW moments (fp32 or 8-bit), "
+                             "and under bf16_master_fp32 its fp32 masters are re-seeded from "
+                             "the saved bf16 weights, so the masters' extra precision is lost "
                              "-- see the RESUME COST instrumentation, which measures what "
                              "that costs instead of asserting it is small.")
     parser.add_argument("--max_steps", type=int, default=0,
@@ -1318,6 +1352,13 @@ def train():
                 raise SystemExit(
                     f"resume state does not match the model: {len(missing)} missing, "
                     f"{len(unexpected)} unexpected. First missing: {list(missing)[:3]}")
+            # The fp32 masters were cloned when the optimizer was built, from the
+            # weights as loaded BEFORE this resume. Left alone, the first step writes
+            # those masters back and silently undoes the resume. Re-seed them in place.
+            _n_reseeded = reseed_masters(optimizer)
+            if _n_reseeded:
+                accelerator.print(f"RESUME re-seeded {_n_reseeded} fp32 masters from the "
+                                  "resumed weights")
             optimizer_steps = int(rs["optimizer_steps"])
             resume_at_step = optimizer_steps
             resume_baseline = rs.get("recent_loss_mean")
@@ -1620,6 +1661,8 @@ def train():
                                 optimizer=None if args.full_ft else optimizer,
                                 data_generator=_data_gen,
                                 keep_all=args.keep_step_checkpoints,
+                                not_restored=(full_ft_not_restored(optimizer) if args.full_ft
+                                              else None),
                                 voice_means=voice_means)
                         # EXP-013. Nothing in this trainer measured how long a step
                         # takes, so a throughput question could only be answered by
