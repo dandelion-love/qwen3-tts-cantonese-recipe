@@ -291,6 +291,16 @@ def test_fold(td: Path):
           m["cer"] == 0.0 and not m["skipped"], str(m))
     lost = sc.clip_measures(row, simp[:3] + simp[9:], sc.RULES, t2s)
     check("fold: a real skip in a simplified transcript is still found", lost["skipped"] and lost["cer"] > 0, str(lost))
+    # Four script-differing characters in a row: unfolded, the aligner pairs the transcript's simplified run with the
+    # reference's later simplified run and reads the traditional one as five characters lost. Folded, the only loss is
+    # the one character the recogniser really dropped, under the run floor.
+    mixed = "我哋嘅關係體驗好关系体验"                       # invented; the reference itself mixes the two scripts
+    heard = t2s.convert(mixed).replace("好", "")
+    import skipped_text as sk
+    check("fold: the plant is real (unfolded, a run of 4+ script-differing characters reads as skipped text)",
+          bool(sk.lost_runs(mixed, heard, sc.RULES["skip_min_run"])))
+    check("fold RED: folded, the same transcript is no skipped text",
+          not sc.clip_measures({**row, "text": mixed}, heard, sc.RULES, t2s)["skipped"])
     saved = sys.modules.get("opencc")
     sys.modules["opencc"] = None                    # makes `import opencc` raise ImportError
     try:
@@ -362,6 +372,14 @@ def test_speaker_phase(td: Path):
     s = run(a, fake_render(lambda arm, d: 3.6), td / "noproc")
     check("spk: no step-<N> at all falls back to the named final_merged",
           [c["label"] for c in s["checkpoints"]] == ["base", "final"])
+    a.checkpoint = []
+    check("spk: without --own-voice the base row carries no voice caveat",
+          "voice_caveat" not in s["base"])
+    a.own_voice = ["v=3000"]
+    a.checkpoint = [str(final)]
+    s = run(a, fake_render(lambda arm, d: 3.6), td / "noproc")
+    check("spk: with --own-voice the base row carries the voice caveat", "borrowed" in s["base"].get("voice_caveat", ""))
+    a.own_voice = []
     a.checkpoint = []
     check("spk RED: with nothing else named, a missing resume/ still refuses",
           refuses(lambda: run(a, fake_render(lambda arm, d: 3.6), td / "noproc"), "missing"))
