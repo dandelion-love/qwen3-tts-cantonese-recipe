@@ -67,5 +67,6 @@ __pycache__/
 
 # --- the few text and JSON files that ARE source --------------------------------------------------------------------
 !requirements.txt
+!requirements-8bit.txt
 !external/js/PINNED.json
 !external/js/fft.js-4.0.4/package.json
