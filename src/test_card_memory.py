@@ -100,7 +100,7 @@ class RecipeTrain(unittest.TestCase):
         self.init = work / "init"                 # train() checks the init checkpoint's size before the card
         self.init.mkdir()
         (self.init / "config.json").write_text('{"tts_model_size": "1b7"}', encoding="utf-8")
-        keys =("batch_size", "gradient_accumulation_steps", "lr", "num_epochs", "warmup_ratio", "lora_rank",
+        keys = ("batch_size", "gradient_accumulation_steps", "lr", "num_epochs", "warmup_ratio", "lora_rank",
                 "lora_alpha", "checkpoint_every_epochs", "checkpoint_every_steps", "sub_talker_weight",
                 "attn_implementation", "seed")
         self.ran = []
