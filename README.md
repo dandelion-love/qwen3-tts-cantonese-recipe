@@ -102,11 +102,32 @@ The release recipe trains LoRA. The trainer also runs a full fine-tune (`--full_
   average. `python trainer/test_full_ft_sr.py` checks the rounding and the update on CPU.
 
 Per trainable parameter that is about 10 bytes (bf16 weight and gradient, fp32 master, 8-bit moments) against 16
-with fp32 moments. The measured peak memory and step time on a 12 GB card are not recorded here yet; this section
-gets that table when they are. `python trainer/test_full_ft_optim.py` checks both options on a tiny model on CPU
+with fp32 moments. `python trainer/test_full_ft_optim.py` checks both options on a tiny model on CPU
 (`FULLFT_TEST_DEVICE=cuda` runs the same steps on the GPU). Since these options, the trainer differs from the one
 that trained the release by more than the argument guard named under "What was checked"; the LoRA path is
 unchanged (it builds the same `AdamW`).
+
+Measured on the 0.6B base on an RTX 3080 Ti (12 GB, under WSL, with a desktop holding 1.7 to 4.8 GB of the card).
+Settings: `--full_ft_scope all --freeze_text_embedding --gradient_checkpointing --full_ft_optimizer adamw8bit`,
+lr 2e-6, gradient accumulation 1, 594.6M trainable parameters, a 192-clip slice of 4 to 9.6 s clips (mean 5.1 s).
+Peak memory is what torch reports for the process (allocated / reserved). Step times are upper bounds, because
+other CPU-heavy jobs were running on the same machine.
+
+| `--full_ft_precision` | batch | peak GiB (alloc / reserved) | s/step | samples/s |
+|---|---|---|---|---|
+| `bf16_master_fp32` | 1 | 8.49 / 8.78 | 0.79 | 1.27 |
+| `bf16_master_fp32` | 2 | 8.51 / 8.72 | 0.84 | 2.37 |
+| `bf16_master_fp32` | 8 | 8.66 / 9.80 | 1.34 | 5.98 |
+| `bf16_sr` | 1 | 4.11 / 4.37 | 0.98 | 1.02 |
+| `bf16_sr` | 8 | 4.37 / 5.36 | 1.02 | 7.87 |
+
+- With fp32 masters the optimizer step takes about 0.15 s. With `bf16_sr` it takes about 0.30 s, because each tensor
+  is widened to fp32 for its own update.
+- Over 200 steps at batch 1, `bf16_master_fp32` reached 8.90 GiB reserved, so on a 12 GB card shared with a desktop
+  it has almost no room to batch. `bf16_sr` leaves several GiB free at batch 8.
+- At lr 2e-6, after 200 steps, 40% of the trainable weights' bf16 values had changed with fp32 masters and 62% with
+  `bf16_sr`. A weight's bf16 value changes only when its update crosses a rounding step, so that fraction grows
+  with steps.
 
 ## Building on the 0.6B base
 
