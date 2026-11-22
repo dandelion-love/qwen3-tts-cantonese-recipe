@@ -388,7 +388,15 @@ def prepare_gguf(ck: dict, a) -> tuple[Path, Path | None]:
             raise SystemExit(f"refusing: {ck['label']} carries no voice {a.speaker!r}; give --bake NAME=ROW and "
                              f"--voice-source (or --own-voice for a speaker phase's steps)")
         import bake_voices
-        print(json.dumps(bake_voices.bake(copy, a.voice_source, parse_voices(a.bake)), ensure_ascii=False), flush=True)
+        audio = {}
+        for spec in a.voice_audio:                  # NAME=CLIP, once per clip, as bake_voices.py takes them
+            name, clip = spec.split("=", 1)
+            audio.setdefault(name, []).append(clip)
+        # The size and, for a base of another width than the source, the clips and the speaker encoder: --init keeps
+        # it (the public base, or the language export a speaker phase starts from), as recipe.py bake's encoder does.
+        print(json.dumps(bake_voices.bake(copy, a.voice_source, parse_voices(a.bake), model_size=a.model_size,
+                                          encoder=a.init if audio else None, audio=audio),
+                         ensure_ascii=False), flush=True)
     if copy is not None and json.loads((copy / "config.json").read_text(encoding="utf-8")).get(
             "tts_model_type") != "custom_voice":
         print(json.dumps(set_custom_voice(copy), ensure_ascii=False), flush=True)
@@ -710,6 +718,10 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--speaker", help="the voice every checkpoint renders with")
     ap.add_argument("--bake", action="append", default=[], help="NAME=ROW baked from --voice-source into the scoring copy")
     ap.add_argument("--voice-source", type=Path)
+    ap.add_argument("--model-size", default="1b7", choices=("1b7", "0b6"),
+                    help="[train].model_size: the scoring copy's tts_model_size, checked by the bake (default 1b7)")
+    ap.add_argument("--voice-audio", action="append", default=[], help="NAME=CLIP, once per clip: for a --bake voice "
+                    "whose --voice-source row is another width, derived by --init's speaker encoder (bake_voices.py)")
     ap.add_argument("--own-voice", action="append", default=[], help="NAME=ROW: bake each step's OWN running mean "
                     "(voice_means.safetensors) at ROW, as the speaker phase's export does")
     ap.add_argument("--no-base", action="store_true", help="do not score the untrained --init as the step-0 row")
@@ -737,8 +749,8 @@ def main(argv=None) -> int:
         return self_test()
     if not (a.lines and a.out and a.speaker):
         parser().error("--lines, --out and --speaker are required")
-    if a.bake and not a.voice_source:
-        parser().error("--bake needs --voice-source")
+    if a.bake and not (a.voice_source or a.voice_audio):
+        parser().error("--bake needs --voice-source or --voice-audio")
     a.out = a.out.expanduser()
     a.key_prefix = a.key_prefix or f"score-{a.out.name}"
     a.mlflow_uri = a.mlflow_uri or f"sqlite:///{a.out / 'mlflow.db'}"
