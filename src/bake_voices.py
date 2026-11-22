@@ -19,7 +19,11 @@ A SOURCE OF ANOTHER WIDTH IS NEVER COPIED. The codec embedding is as wide as the
 on the 0.6B. A 1.7B voice row cannot go into a 0.6B talker, and no slice or projection of it is the same voice. So when
 the source's width differs from the target's (or there is no source), each voice is DERIVED instead, by the target's
 own speaker encoder, the way the speaker phase writes row 3000: the encoder run over the voice's clips (--voice-audio,
-read at 24 kHz, 128-bin mel exactly as the trainer computes it) and the per-clip vectors averaged in fp32. The encoder
+once per clip; 128-bin mel exactly as trainer/dataset.py's extract_mels, which the self-test compares against) and the
+per-clip vectors averaged in fp32. ONE DIFFERENCE FROM THE TRAINER: it asserts 24 kHz input and refuses anything else,
+while this resamples any clip to 24 kHz (librosa) first, so a clip the trainer would refuse still bakes here. On a
+24 kHz clip the two give the same mel. When the source IS the target's width, the source row is copied and any clips
+given are ignored, with a warning on stderr and `clips_ignored` in the record. The encoder
 comes from --encoder, a checkpoint of the target's size that still carries speaker_encoder.* (the recipe's language
 export keeps it; the speaker export drops it; no phase trains it, so the public base's encoder is the same weights).
 A voice with neither a same-width source row nor clips is refused, and so is an encoder whose width is not the
@@ -32,7 +36,7 @@ voice is from the voice the phase learned).
     python src/bake_voices.py --target RUN/spk/final_merged --source RELEASE_MERGED \\
         --voice hk_voice_343=3000 --voice hk_voice_777=3001 --record RUN/bake.json
     python src/bake_voices.py --target RUN/spk/final_merged --model-size 0b6 --encoder RUN/lang/final_merged \\
-        --voice-audio hk_voice_343=CLIP.flac --voice hk_voice_343=3000 --record RUN/bake.json
+        --voice-audio hk_voice_343=CLIP1.flac --voice-audio hk_voice_343=CLIP2.flac --voice hk_voice_343=3000
     python src/bake_voices.py --self-test
 """
 from __future__ import annotations
@@ -76,13 +80,21 @@ def load_clip(path):
     return wav.astype(np.float32)
 
 
+def clip_mel(path):
+    """The (1, frames, 128) mel the speaker encoder reads, with trainer/dataset.py extract_mels's arguments."""
+    import torch
+    from qwen_tts.core.models.modeling_qwen3_tts import mel_spectrogram
+    return mel_spectrogram(torch.from_numpy(load_clip(path)).unsqueeze(0), n_fft=1024, num_mels=128, sampling_rate=SR,
+                           hop_size=256, win_size=1024, fmin=0, fmax=12000).transpose(1, 2)
+
+
 def encoder_mean(encoder: Path, clips: list):
     """The mean speaker-encoder vector over `clips`, by the speaker_encoder.* weights in `encoder`: the arithmetic of
     the speaker phase's row 3000 (mel as trainer/dataset.py, encoder in the checkpoint's dtype, fp32 mean)."""
     import torch
     from safetensors import safe_open
     from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSSpeakerEncoderConfig
-    from qwen_tts.core.models.modeling_qwen3_tts import Qwen3TTSSpeakerEncoder, mel_spectrogram
+    from qwen_tts.core.models.modeling_qwen3_tts import Qwen3TTSSpeakerEncoder
     cfg = json.loads((Path(encoder) / "config.json").read_text(encoding="utf-8"))
     if "speaker_encoder_config" not in cfg:
         raise SystemExit(f"{encoder}: no speaker_encoder_config; use a checkpoint that keeps the speaker encoder")
@@ -102,9 +114,7 @@ def encoder_mean(encoder: Path, clips: list):
     vecs = []
     with torch.inference_mode():
         for c in clips:
-            mel = mel_spectrogram(torch.from_numpy(load_clip(c)).unsqueeze(0), n_fft=1024, num_mels=128,
-                                  sampling_rate=SR, hop_size=256, win_size=1024, fmin=0, fmax=12000).transpose(1, 2)
-            vecs.append(enc(mel.to(dtype))[0].float())
+            vecs.append(enc(clip_mel(c).to(dtype))[0].float())
     return torch.stack(vecs).mean(0)
 
 
@@ -133,6 +143,10 @@ def bake(target: Path, source: Path | None, voices: dict[str, int], model_size: 
     for name, row in voices.items():
         if same_width:
             want[name], how[name] = src[row].to(t[KEY].dtype), {"from": "source", "row": row}
+            if audio.get(name):
+                how[name]["clips_ignored"] = [str(c) for c in audio[name]]
+                print(f"WARNING {name}: the source is the target's width ({width}), so its row is copied and the "
+                      f"{len(audio[name])} clip(s) given are ignored", file=sys.stderr)
         elif name in audio:
             if encoder is None:
                 raise SystemExit(f"{name}: deriving a row needs --encoder (a {model_size} checkpoint with its speaker "
@@ -146,7 +160,7 @@ def bake(target: Path, source: Path | None, voices: dict[str, int], model_size: 
         else:
             why = ("there is no --source" if src is None else
                    f"the source's rows are {src.shape[1]} wide and the target's {width}, so copying is refused")
-            raise SystemExit(f"{name}: {why}; give its clips with --voice-audio {name}=CLIP[,CLIP...] to derive the row "
+            raise SystemExit(f"{name}: {why}; give its clips with --voice-audio {name}=CLIP (once per clip) to derive the row "
                              "by the target's own speaker encoder")
     trained = t[KEY][3000].clone()
     for name, row in voices.items():
@@ -232,13 +246,15 @@ def self_test() -> int:
                 check(f"RED: a config with no tts_model_size is refused (--model-size {size})", False)
             except SystemExit:
                 check(f"RED: a config with no tts_model_size is refused (--model-size {size})", True)
-    fails += width_mismatch_test(check)
+    width_mismatch_test(check)            # counts its failures through check; its return value is not a count
     print("PASS" if not fails else f"FAIL: {fails}")
     return 1 if fails else 0
 
 
-def width_mismatch_test(check) -> int:
-    """A 0b6 target 1024 wide, a source 2048 wide. Returns 0; failures are counted by `check`."""
+def width_mismatch_test(check) -> None:
+    """A 0b6 target 1024 wide, a source 2048 wide. Failures are counted by `check`."""
+    import contextlib
+    import io
     import tempfile
     import numpy as np
     import soundfile as sf
@@ -272,7 +288,7 @@ def width_mismatch_test(check) -> int:
             from qwen_tts.core.models.modeling_qwen3_tts import Qwen3TTSSpeakerEncoder
         except ImportError:
             print("  skip derivation through a real speaker encoder: qwen_tts is not importable")
-            return 0
+            return
         torch.manual_seed(0)
         enc_cfg = {"enc_dim": W, "enc_channels": [32, 32, 32, 32, 96], "enc_attention_channels": 16,
                    "enc_se_channels": 16, "sample_rate": SR}
@@ -296,6 +312,36 @@ def width_mismatch_test(check) -> int:
         check("the record says the row was derived, and from which clips",
               rec["rows"]["hk_voice_343"]["from"] == "own-encoder mean" and len(rec["rows"]["hk_voice_343"]["clips"]) == 2)
         check("an unnamed row is untouched", torch.equal(row[2999], torch.full((W,), 2.0, dtype=torch.bfloat16)))
+        trainer_dir = Path(__file__).resolve().parents[1] / "trainer"
+        sys.path.insert(0, str(trainer_dir))
+        try:
+            from dataset import TTSDataset              # the trainer's own audio loading and mel, as the speaker phase runs it
+        finally:
+            sys.path.remove(str(trainer_dir))
+        wav, sr = TTSDataset._load_audio_to_np(None, str(clips[0]))
+        theirs = TTSDataset.extract_mels(None, audio=wav, sr=sr)
+        ours = clip_mel(clips[0])
+        check("on a 24 kHz clip the mel equals trainer/dataset.py extract_mels's",
+              ours.shape == theirs.shape and torch.allclose(ours, theirs, rtol=0, atol=1e-6))
+        try:
+            TTSDataset.extract_mels(None, *TTSDataset._load_audio_to_np(None, str(clips[1])))
+            check("the trainer refuses a 16 kHz clip (the documented difference: the bake resamples it)", False)
+        except AssertionError:
+            check("the trainer refuses a 16 kHz clip (the documented difference: the bake resamples it)", True)
+        check("a 16 kHz clip is resampled to 24 kHz before the mel (1 s gives 24000 / 256 frames, not 16000 / 256)",
+              abs(clip_mel(clips[1]).shape[1] - 24000 / 256) <= 2)
+        same = td / "same"
+        same.mkdir()
+        save_file({KEY: torch.full((3072, W), 3.0, dtype=torch.bfloat16)}, str(same / "model.safetensors"),
+                  metadata={"format": "pt"})
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rec2 = bake(dst, same, {"hk_voice_343": 3000}, model_size="0b6", encoder=enc_dir,
+                        audio={"hk_voice_343": [str(clips[0])]})
+        check("clips given beside a same-width source are copied over, warned and recorded as ignored",
+              "ignored" in err.getvalue() and rec2["rows"]["hk_voice_343"].get("clips_ignored") == [str(clips[0])]
+              and torch.equal(load_file(str(dst / "model.safetensors"))[KEY][3000],
+                              torch.full((W,), 3.0, dtype=torch.bfloat16)))
         try:
             bake(dst, None, {"hk_voice_343": 3000, "hk_voice_777": 3001}, model_size="0b6", encoder=enc_dir,
                  audio={"hk_voice_343": [str(clips[0])]})
@@ -314,7 +360,6 @@ def width_mismatch_test(check) -> int:
             check("RED: an encoder of the other size (2048-wide vectors) is refused", False)
         except SystemExit:
             check("RED: an encoder of the other size (2048-wide vectors) is refused", True)
-    return 0
 
 
 def main() -> int:
@@ -327,7 +372,8 @@ def main() -> int:
     ap.add_argument("--encoder", type=Path, help="a checkpoint of the target's size carrying speaker_encoder.*, to "
                                                  "derive rows a source of another width cannot give")
     ap.add_argument("--voice-audio", action="append", default=[],
-                    help="NAME=CLIP[,CLIP...]: the voice's clips, for a row derived by the target's own encoder")
+                    help="NAME=CLIP, once per clip (a path may hold any character, commas included): the voice's "
+                         "clips, for a row derived by the target's own encoder")
     ap.add_argument("--record", type=Path, help="write the record here too")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args()
@@ -337,8 +383,10 @@ def main() -> int:
         ap.error("--target, --source or --voice-audio, and at least one --voice are required")
     audio = {}
     for spec in a.voice_audio:
-        name, clips = spec.split("=", 1)
-        audio[name] = [c for c in clips.split(",") if c]
+        name, clip = spec.split("=", 1)
+        if not clip:
+            ap.error(f"--voice-audio {spec}: no clip path")
+        audio.setdefault(name, []).append(clip)
     if set(audio) - set(parse_voices(a.voice)):
         ap.error(f"--voice-audio names a voice that no --voice bakes: {sorted(set(audio) - set(parse_voices(a.voice)))}")
     rec = bake(a.target, a.source, parse_voices(a.voice), a.model_size, a.encoder, audio)

@@ -94,9 +94,20 @@ class ModelSizeTests(unittest.TestCase):
         data = self.work / "data.jsonl"
         data.write_text("{}\n", encoding="utf-8")
         r = make_recipe(self.work, train={"model_size": "0b6"})
-        with mock.patch.object(recipe.Recipe, "run") as run, self.assertRaises(SystemExit):
+        with mock.patch.object(recipe.Recipe, "run") as run, self.assertRaises(SystemExit) as e:
             recipe.train(r, "lang", base, data, [])
         run.assert_not_called()
+        self.assertIn("tts_model_size", str(e.exception))
+        self.assertIn("'0b6'", str(e.exception))
+
+    def test_train_refuses_an_init_without_config_json(self):
+        data = self.work / "data.jsonl"
+        data.write_text("{}\n", encoding="utf-8")
+        r = make_recipe(self.work, train={})
+        with mock.patch.object(recipe.Recipe, "run") as run, self.assertRaises(SystemExit) as e:
+            recipe.train(r, "lang", self.work / "nobase", data, [])
+        run.assert_not_called()
+        self.assertIn("config.json is missing", str(e.exception))
 
     def test_train_export_check_reads_the_setting(self):
         data = self.work / "data.jsonl"
@@ -107,6 +118,8 @@ class ModelSizeTests(unittest.TestCase):
             out.mkdir(parents=True)
             (out / "config.json").write_text(json.dumps({"tts_model_size": "0b6", "talker_config": {}}),
                                              encoding="utf-8")
+        base = self.work / "base"
+        base.mkdir()
         cm = mock.Mock()
         cm.check_floor.return_value = {"mib": 99999}
         for size, ok in (("0b6", True), ("1b7", False)):
@@ -114,19 +127,23 @@ class ModelSizeTests(unittest.TestCase):
                 import shutil
                 shutil.rmtree(out)
             r = make_recipe(self.work, train={"model_size": size})
+            (base / "config.json").write_text(json.dumps({"tts_model_size": size}), encoding="utf-8")
             with mock.patch.object(recipe.Recipe, "run", side_effect=fake_run), \
                     mock.patch.object(recipe, "card_memory", return_value=cm), \
                     mock.patch.object(recipe, "mlflow_run_id", return_value=None):
                 if ok:
-                    self.assertEqual(recipe.train(r, "lang", self.work / "nobase", data, [])["tts_model_size"], "0b6")
+                    self.assertEqual(recipe.train(r, "lang", base, data, [])["tts_model_size"], "0b6")
                 else:
-                    with self.assertRaises(SystemExit):
-                        recipe.train(r, "lang", self.work / "nobase", data, [])
+                    with self.assertRaises(SystemExit) as e:
+                        recipe.train(r, "lang", base, data, [])
+                    self.assertIn("lang export", str(e.exception))
 
     def test_bake_command_carries_the_size_and_derives_without_a_source(self):
         r = make_recipe(self.work, train={"model_size": "0b6"}, paths={"voice_source": ""},
-                        bake={"voices": {"hk_voice_343": 3000}, "voice_audio": {"hk_voice_343": ["/clips/a.flac"]}})
+                        bake={"voices": {"hk_voice_343": 3000},
+                              "voice_audio": {"hk_voice_343": ["/clips/a.flac", "/clips/b,c.flac"]}})
         cmd = [str(c) for c in recipe.bake_command(r)]
+        self.assertIn("--voice-audio=hk_voice_343=/clips/b,c.flac", cmd)     # one flag per clip, a comma survives
         self.assertEqual(cmd[cmd.index("--model-size") + 1], "0b6")
         self.assertNotIn("--source", cmd)
         self.assertEqual(cmd[cmd.index("--encoder") + 1], str(self.work / "train" / "lang" / "final_merged"))

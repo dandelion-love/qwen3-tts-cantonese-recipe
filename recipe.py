@@ -387,9 +387,11 @@ def train(r: Recipe, phase: str, init: Path, data: Path, extra: list) -> dict:
     cmd = [r.py, TRAINER, "--init_model_path", init, "--output_model_path", out, "--train_jsonl", data,
            *recipe_flags(t), "--mlflow_tracking_uri", f"sqlite:///{db}", *extra]
     if not r.dry:
-        init_cfg = Path(init) / "config.json"
-        if init_cfg.exists():                       # refuse a base of the wrong size before the card is spent on it
-            require_size(json.loads(init_cfg.read_text(encoding="utf-8")), model_size(r), f"{phase} init {init}")
+        init_cfg = Path(init) / "config.json"     # refuse a base of the wrong size before the card is spent on it
+        if not init_cfg.is_file():
+            raise SystemExit(f"{phase}: {init_cfg} is missing, so tts_model_size cannot be checked against "
+                             f"[train].model_size {model_size(r)!r}; give a local checkpoint directory, not a hub id")
+        require_size(json.loads(init_cfg.read_text(encoding="utf-8")), model_size(r), f"{phase} init {init}")
         if (out / "final_merged").exists():
             raise SystemExit(f"{out}/final_merged exists: phase {phase} is trained already (move it to retrain)")
         if not data.exists():
@@ -458,7 +460,7 @@ def bake_command(r: Recipe) -> list:
         cmd += ["--source", r.path("voice_source")]
     if audio:
         cmd += ["--encoder", r.work / "train" / "lang" / "final_merged"]
-        cmd += [f"--voice-audio={n}={','.join(c)}" for n, c in audio.items()]
+        cmd += [f"--voice-audio={n}={clip}" for n, clips in audio.items() for clip in clips]   # one flag per clip
     cmd += [f"--voice={n}={row}" for n, row in r.cfg["bake"]["voices"].items()]
     return cmd + ["--record", r.work / "records" / "bake-rows.json"]
 
