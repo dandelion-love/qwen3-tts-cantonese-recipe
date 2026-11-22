@@ -167,6 +167,28 @@ def code_commit() -> str:
         return "unknown"
 
 
+MODEL_SIZES = ("1b7", "0b6")                    # the values tts_model_size takes in a Qwen3-TTS config.json
+
+
+def model_size(r: Recipe) -> str:
+    """[train].model_size: which base the build trains, 1b7 unless set. Every size check reads it from here."""
+    size = r.cfg["train"].get("model_size", "1b7")
+    if size not in MODEL_SIZES:
+        raise SystemExit(f"[train].model_size = {size!r}: use one of {', '.join(MODEL_SIZES)}")
+    return size
+
+
+def require_size(cfg: dict, want: str, where) -> None:
+    """Refuse a config whose tts_model_size is not `want`. A MISSING key is refused too, never assumed: Qwen-TTS
+    Studio's converter defaults a missing size to 0b6, which mislabels a 1.7B model silently."""
+    got = cfg.get("tts_model_size")
+    if got is None:
+        raise SystemExit(f"{where}: config.json has no tts_model_size (the converter would assume '0b6'); "
+                         f"[train].model_size is {want!r}")
+    if got != want:
+        raise SystemExit(f"{where}: tts_model_size {got!r}, not {want!r} ([train].model_size)")
+
+
 def card_memory():
     """src/card_memory.py: nvidia-smi with retries, then torch in a subprocess; refuses only on a measured value."""
     sys.path.insert(0, str(SRC))
@@ -365,6 +387,9 @@ def train(r: Recipe, phase: str, init: Path, data: Path, extra: list) -> dict:
     cmd = [r.py, TRAINER, "--init_model_path", init, "--output_model_path", out, "--train_jsonl", data,
            *recipe_flags(t), "--mlflow_tracking_uri", f"sqlite:///{db}", *extra]
     if not r.dry:
+        init_cfg = Path(init) / "config.json"
+        if init_cfg.exists():                       # refuse a base of the wrong size before the card is spent on it
+            require_size(json.loads(init_cfg.read_text(encoding="utf-8")), model_size(r), f"{phase} init {init}")
         if (out / "final_merged").exists():
             raise SystemExit(f"{out}/final_merged exists: phase {phase} is trained already (move it to retrain)")
         if not data.exists():
@@ -379,8 +404,7 @@ def train(r: Recipe, phase: str, init: Path, data: Path, extra: list) -> dict:
     rec = {"command": [str(c) for c in cmd], "wall_s": round(time.time() - t0), "data_sha256": sha256(data),
            "mlflow_run_id": mlflow_run_id(db), "card_free": card_free, "tts_model_type": cfg.get("tts_model_type"),
            "tts_model_size": cfg.get("tts_model_size"), "spk_id": cfg.get("talker_config", {}).get("spk_id")}
-    if rec["tts_model_size"] != "1b7":
-        raise SystemExit(f"{phase}: tts_model_size {rec['tts_model_size']!r}, not '1b7'")
+    require_size(cfg, model_size(r), f"{phase} export")
     return rec
 
 
@@ -409,24 +433,53 @@ def gguf_dir(r: Recipe) -> Path:
     return cache / r.cfg["convert"]["key"]
 
 
+def voice_audio(r: Recipe) -> dict[str, list[str]]:
+    """[bake].voice_audio: NAME = a clip or a list of clips (${VAR} and ~ expanded), for voices derived by the
+    target's own speaker encoder. A path naming an unset variable refuses."""
+    out = {}
+    for name, clips in r.cfg["bake"].get("voice_audio", {}).items():
+        clips = [clips] if isinstance(clips, str) else list(clips)
+        paths = [expand(c) for c in clips]
+        if not all(paths):
+            if not r.dry:
+                raise SystemExit(f"[bake].voice_audio.{name} names an unset variable: {clips}")
+            paths = [p or f"<{c}>" for p, c in zip(paths, clips)]
+        out[name] = paths
+    return out
+
+
+def bake_command(r: Recipe) -> list:
+    """bake_voices.py's command. A row is copied from [paths].voice_source when its width matches the target's;
+    otherwise it is derived from the clips in [bake].voice_audio by the language export's speaker encoder (the
+    language phase keeps it; the speaker phase drops it, and no phase trains it)."""
+    cmd = [r.py, SRC / "bake_voices.py", "--target", export_dir(r), "--model-size", model_size(r)]
+    audio = voice_audio(r)
+    if r.paths.get("voice_source") or not audio or set(r.cfg["bake"]["voices"]) - set(audio):
+        cmd += ["--source", r.path("voice_source")]
+    if audio:
+        cmd += ["--encoder", r.work / "train" / "lang" / "final_merged"]
+        cmd += [f"--voice-audio={n}={','.join(c)}" for n, c in audio.items()]
+    cmd += [f"--voice={n}={row}" for n, row in r.cfg["bake"]["voices"].items()]
+    return cmd + ["--record", r.work / "records" / "bake-rows.json"]
+
+
 def stage_bake(r: Recipe) -> None:
-    voices = [f"--voice={n}={row}" for n, row in r.cfg["bake"]["voices"].items()]
-    r.run("bake", [r.py, SRC / "bake_voices.py", "--target", export_dir(r), "--source", r.path("voice_source"),
-                   *voices, "--record", r.work / "records" / "bake-rows.json"])
-    r.record("bake", {"target": str(export_dir(r)), "source": str(r.path("voice_source")), "voices": r.cfg["bake"]["voices"]})
+    cmd = bake_command(r)
+    r.run("bake", cmd)
+    r.record("bake", {"target": str(export_dir(r)), "source": r.paths.get("voice_source") or None,
+                      "model_size": model_size(r), "voices": r.cfg["bake"]["voices"], "voice_audio": voice_audio(r)})
 
 
 def stage_convert(r: Recipe) -> None:
     if not r.dry:
         cfg = json.loads((export_dir(r) / "config.json").read_text(encoding="utf-8"))
-        if cfg.get("tts_model_size") != "1b7":       # Studio's converter defaults a missing size to 0b6
-            raise SystemExit(f"{export_dir(r)}: tts_model_size {cfg.get('tts_model_size')!r}, not '1b7'")
+        require_size(cfg, model_size(r), export_dir(r))    # Studio's converter defaults a missing size to 0b6
         want = {n: int(v) for n, v in r.cfg["bake"]["voices"].items()}
         if cfg["talker_config"].get("spk_id") != want:
             raise SystemExit(f"spk_id {cfg['talker_config'].get('spk_id')} is not the baked {want}: run `recipe.py bake`")
     c = r.cfg["convert"]
     r.run("convert", [r.py, SRC / "gguf_backend.py", "--convert", export_dir(r), "--key", c["key"], "--quant", c["quant"]])
-    rec = {"gguf_dir": str(gguf_dir(r)), "key": c["key"], "quant": c["quant"]}
+    rec = {"gguf_dir": str(gguf_dir(r)), "key": c["key"], "quant": c["quant"], "model_size": model_size(r)}
     if not r.dry:
         talkers = sorted(gguf_dir(r).glob("qwen-talker-*.gguf"))
         rec["talker"] = {t.name: hashlib.md5(t.read_bytes()).hexdigest() for t in talkers}

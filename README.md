@@ -72,8 +72,8 @@ kept for traceability and are not needed to run anything.
 | 2. Cleanup | Sidon v0.1 restoration, then `dynamics` (the raw clip's loudness contour put back), edges v2 and `trim` (0.10 s before the speech, 0.30 s after); `pad` back to the source length with digital silence on the **speaker clips only**; then `audio` and `encode` (the 12 Hz codec). Each step is an immutable, re-runnable store layer | exclude a clip whose Sidon envelope correlation is under 0.5 |
 | 3. Sets | the language set is the trimmed yue rows followed by the trimmed zh-HK rows, concatenated; the speaker set is the padded donor clips (D1's, unchanged) | 33,097 + 29,511 = 62,608 and 343 rows in the lab; `speaker_id` cv_yue_v22 / cv_zhhk_27 / cv_voice6 |
 | 4. Training | language phase from the public base with `--keep_speaker_encoder`, then a speaker phase on the donor's clips, one voice `hk_voice_343` | LoRA r32/a64, lr 1e-4, warmup 0.03, batch 1 x grad-accum 4, 1 epoch, `sub_talker_weight` 0, sdpa, a checkpoint every 500 steps |
-| 5. Voices | the chosen vectors copied into `codec_embedding` from a source checkpoint (`VOICE_SOURCE`, below) | `hk_voice_343` row 3000 (the released voice); row 3001 is also baked |
-| 6. Conversion | GGUF q8_0 for [Qwen-TTS Studio](https://github.com/hobpond/qwen-tts-studio), through the pinned qwen3-tts.cpp runtime | `tts_model_size` must be `1b7` |
+| 5. Voices | the chosen vectors copied into `codec_embedding` from a source checkpoint (`VOICE_SOURCE`, below), or on a base of another width derived by its own speaker encoder (below) | `hk_voice_343` row 3000 (the released voice); row 3001 is also baked |
+| 6. Conversion | GGUF q8_0 for [Qwen-TTS Studio](https://github.com/hobpond/qwen-tts-studio), through the pinned qwen3-tts.cpp runtime | `tts_model_size` must be `[train].model_size` (`1b7`); a config without one is refused |
 | 7. Measures | first-draw renders of held-out short lines and long prose at chunk ceiling 45, for the voice and for v0.0.1; the release gate's Part A and the checkpoint card, each voice on its own | thresholds in `[gate]`; A7 waived by the owner (below) |
 | 8. Listening | long prose by paragraph, blind, 1-5 ratings, per-character marks and notes, skipped text redrawn for the final page | `[pages]` |
 
@@ -104,6 +104,26 @@ gets that table when they are. `python trainer/test_full_ft_optim.py` checks bot
 (`FULLFT_TEST_DEVICE=cuda` runs the same steps on the GPU). Since these options, the trainer differs from the one
 that trained the release by more than the argument guard named under "What was checked"; the LoRA path is
 unchanged (it builds the same `AdamW`).
+
+## Building on the 0.6B base
+
+The recipe trains the 1.7B base by default. To build on `Qwen/Qwen3-TTS-12Hz-0.6B-Base` instead:
+
+1. Point `[paths].base_model` (`TTS_BASE_MODEL`) at the 0.6B base and set `[train].model_size = "0b6"`. Every size
+   check reads that one value: the base before the language phase starts, each phase's export, the bake and the
+   conversion. A `config.json` with no `tts_model_size` is refused whatever the setting, because Qwen-TTS Studio's
+   converter reads a missing size as `0b6` and would mislabel a 1.7B model without a word.
+2. Give each voice's clips in `[bake].voice_audio` (`hk_voice_343 = ["/path/clip.flac", ...]`). The 0.6B talker's
+   codec embedding is 1024 wide; the released voice rows are 2048 wide, so they cannot be copied and no slice of one
+   is the same voice. `bake_voices.py` refuses the copy and instead runs the 0.6B speaker encoder (from the language
+   export, which keeps it) over the clips at 24 kHz and writes the fp32 mean, the same arithmetic the speaker phase
+   uses for row 3000. A voice with neither a same-width source row nor clips is refused. `VOICE_SOURCE` may stay
+   unset when every voice has clips. Every voice in `[bake].voices` needs clips, including row 3001.
+3. `recipe.py convert` then converts with the same pinned runtime; its converter handles both sizes. A 0.6B
+   `custom_voice` export converts without voice instructions (the converter enables them on `1b7` only).
+
+`python src/test_model_size.py` checks the size setting and the bake command; `python src/bake_voices.py --self-test`
+checks the copy, the refusals and the derivation against a 1024-wide target with a small real speaker encoder.
 
 ## Where the v0.0.5 build's data starts
 

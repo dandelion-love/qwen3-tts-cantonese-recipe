@@ -152,6 +152,12 @@ attn_implementation = "sdpa"
 # a new recipe: compare recipes over several seeds.
 seed = 1
 fast_kernels = false                     # true: seeded but fast GPU kernels (about 0.0005 apart after 30 steps instead of 0.0); for exploration only, a release trains exact
+# Which public base the build trains: "1b7" (Qwen3-TTS-12Hz-1.7B-Base) or "0b6" (the 0.6B-Base, with [paths].base_model
+# pointed at it). Every size check reads this: the base before training, each export after it, the bake and the
+# conversion. A checkpoint whose config.json has no tts_model_size is refused whatever it says, because Qwen-TTS
+# Studio's converter reads a missing size as 0b6. On 0b6 the talker is 1024 wide, so 1.7B voice rows cannot be
+# copied: give the voice's clips in [bake].voice_audio.
+model_size = "1b7"
 language_extra = ["--keep_speaker_encoder"]          # from the public base; the speaker phase needs the encoder
 speaker_name = "hk_voice_343"                        # one voice per speaker phase, baked at row 3000
 speaker_extra = []                                   # more trainer arguments for the speaker phase only, e.g.
@@ -164,6 +170,11 @@ min_free_mib = 10000                                 # refuse to start on a card
 # [paths].voice_source: today v0.0.1's single-clip 343 vector at 3000 and the 777 averaged vector at 3001.
 voices = { hk_voice_343 = 3000, hk_voice_777 = 3001 }   # 777 is still baked but no longer evaluated or shipped;
                                                       # it leaves the bake once EXP-109 (which builds from here) ends
+# A row is copied from voice_source only when it is as wide as the target's (2048 on 1.7B, 1024 on 0.6B). For any other
+# target, each voice is derived instead: the language export's speaker encoder run over the clips named here and the
+# vectors averaged, the arithmetic of the speaker phase's row 3000. NAME = "clip" or ["clip", ...]; ${VAR} expands.
+# Empty on a 1.7B build. A voice that can be neither copied nor derived is refused, never filled with a slice.
+voice_audio = {}
 
 # ---------------------------------------------------------------------------------------------------- 6. conversion
 [convert]
