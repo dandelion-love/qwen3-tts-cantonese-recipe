@@ -1673,12 +1673,28 @@ def train():
                     accelerator.backward(loss)
 
                     if accelerator.sync_gradients:
-                        accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                        _grad_norm = accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                        _step_lr = scheduler.get_last_lr()[0]    # the rate this update is taken at
                         optimizer.step()
                         scheduler.step()          # ← Warmup happens here
                         optimizer.zero_grad()
                         optimizer_steps += 1
                         _recent_losses.append(float(loss.detach()))
+                        # PER-STEP SIGNALS (SFT path). The pre-clip total gradient norm and the two loss terms, at
+                        # every optimizer step: a learning rate that is too high shows first as a climbing norm or a
+                        # sub-talker term that rises while the talker term falls, and the epoch means below show it
+                        # only after the epoch. With gradient accumulation the loss terms are the step's LAST
+                        # micro-batch, not its mean. The scalars are read after the update; the step's arithmetic is
+                        # unchanged.
+                        if not pref and accelerator.is_main_process:
+                            _sl = {"grad_norm": float(_grad_norm) if _grad_norm is not None else float("nan"),
+                                   "talker_loss": float(talker_loss.detach()),
+                                   "sub_talker_loss": float(sub_talker_loss.detach()),
+                                   "step_lr": _step_lr}
+                            mlflow.log_metrics(_sl, step=optimizer_steps)
+                            if optimizer_steps % 10 == 0:
+                                accelerator.print(f"STEPLOG step={optimizer_steps} "
+                                                  + " ".join(f"{k}={v:.6g}" for k, v in _sl.items()))
                         if len(_recent_losses) > 64:
                             del _recent_losses[:-64]
                         # === RESUME COST, MEASURED ONCE PER RESUME ===
