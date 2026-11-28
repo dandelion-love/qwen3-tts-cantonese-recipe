@@ -20,6 +20,10 @@ or [Qwen-TTS Studio](https://github.com/hobpond/qwen-tts-studio), or the
 
 ## Rebuild v0.0.5
 
+**Check out the tag `v0.0.5` to rebuild it.** Since then the recipe's language sets no longer use the register filter
+(`require_colloquial`, *Language data is not register-filtered*, below), so the language data this branch selects is
+not v0.0.5's and its talker md5 will not match.
+
 What reproduces exactly, and what does not:
 
 - **Training is exact.** Seeded training (`seed`, with `fast_kernels = false`) gives bit-identical weights on the same
@@ -68,9 +72,9 @@ kept for traceability and are not needed to run anything.
 
 | Step | What | Values (all in `recipe.toml`) |
 |---|---|---|
-| 1. Data | Common Voice `yue` 22.0: v0.0.1's language set (validated, 3-30 s, colloquial transcripts, no down-votes, every speaker; edge silence trimmed at ingest, 4 s floor on the decoded audio); **plus Common Voice zh-HK 27.0** from Mozilla Data Collective (validated, 3-30 s, colloquial, no down-votes, no accent or gender filter, seed 4242); and one donor's clips | 33,104 yue + 29,562 zh-HK + 343 clips in the lab |
+| 1. Data | Common Voice `yue` 22.0 (validated, 3-30 s, every transcript, no down-votes, every speaker; edge silence trimmed at ingest, 4 s floor on the decoded audio); **plus Common Voice zh-HK 27.0** from Mozilla Data Collective (validated, 3-30 s, every transcript, no down-votes, no accent or gender filter, seed 4242); and one donor's clips. No register filter on either language set (below) | zh-HK: 60,329 clips selected (measured; v0.0.5 had 29,562 with the filter); yue: not yet counted without the filter (v0.0.5: 33,104); 343 donor clips |
 | 2. Cleanup | Sidon v0.1 restoration, then `dynamics` (the raw clip's loudness contour put back), edges v2 and `trim` (0.10 s before the speech, 0.30 s after); `pad` back to the source length with digital silence on the **speaker clips only**; then `audio` and `encode` (the 12 Hz codec). Each step is an immutable, re-runnable store layer | exclude a clip whose Sidon envelope correlation is under 0.5 |
-| 3. Sets | the language set is the trimmed yue rows followed by the trimmed zh-HK rows, concatenated; the speaker set is the padded donor clips (D1's, unchanged) | 33,097 + 29,511 = 62,608 and 343 rows in the lab; `speaker_id` cv_yue_v22 / cv_zhhk_27 / cv_voice6 |
+| 3. Sets | the language set is the trimmed yue rows followed by the trimmed zh-HK rows, concatenated; the speaker set is the padded donor clips (D1's, unchanged) | v0.0.5: 33,097 + 29,511 = 62,608 and 343 rows; without the register filter the language rows are not yet counted; `speaker_id` cv_yue_v22 / cv_zhhk_27 / cv_voice6 |
 | 4. Training | language phase from the public base with `--keep_speaker_encoder`, then a speaker phase on the donor's clips, one voice `hk_voice_343` | LoRA r32/a64, lr 1e-4, warmup 0.03, batch 1 x grad-accum 4, 1 epoch, `sub_talker_weight` 0, sdpa, a checkpoint every 500 steps |
 | 5. Voices | the chosen vectors copied into `codec_embedding` from a source checkpoint (`VOICE_SOURCE`, below), or on a base of another width derived by its own speaker encoder (below) | `hk_voice_343` row 3000 (the released voice); row 3001 is also baked |
 | 6. Conversion | GGUF q8_0 for [Qwen-TTS Studio](https://github.com/hobpond/qwen-tts-studio), through the pinned qwen3-tts.cpp runtime | `tts_model_size` must be `[train].model_size` (`1b7`); a config without one is refused |
@@ -84,6 +88,26 @@ language set too, it brought runaways back); the voice row is chosen, never assu
 whole clauses, 45 do not; zh-HK adds Hong Kong speech to a `yue` pool drawn from the whole Cantonese-speaking world
 (in one early selection only 3.9% of clips were labelled Hong Kong). zh-HK is a language set, so it is trimmed and
 not padded.
+
+### Language data is not register-filtered
+
+The selectors can keep only transcripts that carry a colloquial Cantonese marker (`--require-colloquial`). That filter
+drops formal written Chinese, idioms, place names and short phrases, all of which the contributors read aloud in
+Cantonese and all of which a model that reads books and news needs. On zh-HK 27.0 (validated, 3-30 s, no down-votes)
+it halves the selection, from 60,329 clips (81 h, 2,288 contributors) to 29,562 (42 h, 1,946); on `yue` it drops about
+a fifth of the transcripts. v0.0.5 was built with it on both language sets.
+
+So the filter never applies to language data:
+
+- both selectors default it off; it is an explicit opt-in;
+- `recipe.py` refuses `require_colloquial = true` on every `[data]` set except `[data.speaker]`, whichever stage runs;
+- a language set given already selected (`LANG_SELECTED_DIR`) whose `selection.json` records the filter is refused,
+  and one with no `selection.json` is reported as unchecked;
+- `python src/test_register_filter.py` shows each refusal firing and the speaker set still able to opt in.
+
+The expected clip and row counts of the language sets were v0.0.5's, measured with the filter, so they are no longer
+recorded in `recipe.toml`; `recipe.py select` reports each set's count and says no expectation is recorded. The
+language phase trains on more rows, so it takes longer than the times quoted below.
 
 ### Full fine-tuning on a 12 GB card
 
@@ -155,7 +179,8 @@ The owner's decision for the from-scratch build (2026-10-22): **"Start from the 
 sets cannot be re-selected by download:
 
 - **yue 22.0**: the Common Voice 22.0 pool the lab selected from is no longer held, so the lab's own selection (its
-  55,668 selected clips, `audio/` + `transcripts.tsv`) is given as `LANG_SELECTED_DIR`; ingest with edge-silence
+  55,668 selected clips, `audio/` + `transcripts.tsv`, made with the register filter on) is given as
+  `LANG_SELECTED_DIR` (on the tag `v0.0.5`; this branch refuses a language selection recorded with the filter); ingest with edge-silence
   trimming at a 4.0 s floor should give v0.0.1's 33,104 (a 40-row sample of v0.0.1's set matches the trimmed decode,
   not the untrimmed one; the full count has not been re-run).
 - **the donor's 343 clips**: they came from an earlier `yue` release whose number was not recorded. From 22.0 the
@@ -290,7 +315,8 @@ Checked without a GPU (2026-10-22): every module imports; every stage's `--dry-r
 self-tests pass (`scripts/check_clean_room.py`, `scripts/check_publishable.py`, `src/gguf_backend.py`,
 `src/bake_voices.py`, `src/render_short.py`, `src/skipped_text.py`, `src/select_mdc.py`, `src/release_gate.py`,
 `src/checkpoint_card.py`, `trainer/test_voice_bank.py`, `trainer/test_epoch_accounting.py`; since 2026-11-05
-`src/test_card_memory.py`, the free-memory probe with faked failures); `cleanup` and `sets`
+`src/test_card_memory.py`, the free-memory probe with faked failures; since 2026-11-27 `src/test_register_filter.py`,
+the register filter's refusals on language sets); `cleanup` and `sets`
 ran end to end on synthetic yue, zh-HK and speaker clips with Sidon and the codec replaced by CPU stand-ins (the
 language set came out as the yue rows then the zh-HK rows, zh-HK trimmed and not padded); the standard page built from a
 synthetic clip and round-tripped a code. Read-only on the lab's stored EXP-099 D1 and v0.0.1 layers,

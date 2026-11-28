@@ -6,6 +6,13 @@
 # to the language phase. A change to any value in [data], [cleanup], [sets], [train] or [bake] is a different
 # recipe, not a tuning of this one.
 #
+# AND [data] HAS CHANGED SINCE v0.0.5: the language sets no longer use the register filter (require_colloquial). It kept
+# only transcripts carrying a colloquial Cantonese marker, which dropped formal written Chinese, idioms, place names
+# and short phrases that the speakers read in Cantonese -- the material a model reading books and news needs. On
+# zh-HK it halves the selection (60,329 clips to 29,562, measured below). So this file is no longer v0.0.5's recipe:
+# to rebuild v0.0.5, check out the tag v0.0.5. recipe.py refuses require_colloquial = true on any [data] set but
+# [data.speaker]. The expected counts of the two language sets are not recorded until a build measures them.
+#
 # Paths: absolute, ~, or ${VAR} (expanded from the environment; unset is empty, and a stage that needs it refuses).
 # Nothing here may point inside this repository: the recipe writes audio, codes and weights, and none of that may
 # enter it (scripts/check_clean_room.py).
@@ -48,7 +55,7 @@ splits = ["validated"]
 min_duration = 3.0                         # selector, on Common Voice's own clip_durations.tsv
 max_duration = 30.0
 gender = ""                                # "" = no gender filter
-require_colloquial = true                  # transcripts with colloquial Cantonese markers only
+require_colloquial = false                 # never on a language set: recipe.py refuses true here (header)
 drop_down_voted = true
 seed = 4242
 ingest_min_duration = 4.0                  # on the decoded, edge-trimmed 24 kHz audio (ingest_recordings.py)
@@ -56,14 +63,20 @@ ingest_max_duration = 30.0
 ingest_trim_silence = true                 # ingest_recordings --trim-silence at its defaults (0.15, 0.20 s)
 speaker_id = "cv_yue_v22"                  # one constant for every language row, as v0.0.1
 selected_dir = "lang_selected_dir"         # [paths] entry that, when set, replaces the selector for this set
-expect_clips = 33104                       # v0.0.1's count; a different count is reported, not refused
-expect_rows = 33097                        # after the Sidon exclusion (7 in the lab)
+# expect_clips / expect_rows: not recorded. v0.0.1's 33,104 clips (33,097 rows) were selected WITH the register
+# filter; the yue 22.0 pool is not held to re-count without it, and a set given as lang_selected_dir that records
+# require_colloquial = true in its selection.json is refused. A set's count is reported, never refused.
 
 [data.zhhk]
 # Common Voice zh-HK 27.0, the Hong Kong half of H1's language phase (EXP-100). Only on Mozilla Data Collective, as
 # one archive; you download it under MDC's terms (no re-hosting, no identifying contributors). The lab's selection:
 # validated, 3-30 s, colloquial transcripts, no down-votes, no gender or accent filter, seed 4242 -> 29,562 clips,
 # 42 h, 1,946 contributors -> 29,511 rows (exp100 counted 46 excluded by env_corr; 51 fewer than selected in all).
+# THIS RECIPE DROPS THE REGISTER FILTER (header). Measured 2026-11-27 with select_mdc.py --dry-run on the same archive
+# and filters: 94,172 validated clips; 28,133 dropped by duration, 5,710 by down-votes; register filter off -> 60,329
+# selected, 80.99 h, median 4.46 s, 2,288 contributors (on -> 29,562, 42.04 h, 1,946, as the lab's). Those are selector
+# counts: ingest and the Sidon exclusion have not been run on the 60,329, so expect_clips / expect_rows are not
+# recorded.
 collection = "zhhk"
 archive = "zhhk_mdc_archive"               # always read from this [paths] entry (select_mdc.py)
 locale = "zh-HK"
@@ -71,15 +84,13 @@ splits = ["validated"]
 min_duration = 3.0
 max_duration = 30.0
 gender = ""
-require_colloquial = true
+require_colloquial = false                 # never on a language set (header)
 drop_down_voted = true
 seed = 4242
 ingest_min_duration = 3.0                  # the lab ingested zh-HK at 24 kHz FLAC, 3-30 s
 ingest_max_duration = 30.0
 ingest_trim_silence = false                # measured: 30 of 30 sampled lab clips equal the untrimmed decode
 speaker_id = "cv_zhhk_27"
-expect_clips = 29562
-expect_rows = 29511
 
 [data.speaker]
 # The voice donor's clips: one Common Voice contributor, selected by the pseudonym in [paths].donor_ids.
@@ -91,7 +102,7 @@ splits = ["validated"]
 min_duration = 3.0
 max_duration = 30.0
 gender = ""
-require_colloquial = false
+require_colloquial = false                 # the one set that may opt in to the register filter
 drop_down_voted = true
 seed = 4242
 # The donor's 343 = the lab's 348 selected clips through ingest --trim-silence at a 4.0 s floor (measured
