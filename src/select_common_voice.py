@@ -15,9 +15,12 @@ each one costs so the yield is auditable rather than asserted:
   listener actively flagged the clip, which is the only quality signal available
   without listening to 141k files. Clips carrying a down-vote are dropped even
   though they are otherwise eligible.
-* **Register.** ~81% of `yue` transcripts carry colloquial Cantonese markers; the
-  rest read as Standard Written Chinese, which is a different register from the
-  target speaker's code-switched speech. Optional, on by default.
+* **Register (opt-in, never for a language phase).** ~81% of `yue` transcripts carry
+  colloquial Cantonese markers; the rest are formal written Chinese, idioms, place
+  names and short phrases, which the contributors still read aloud in Cantonese and
+  which a model that reads books and news needs. `--require-colloquial` keeps only
+  the marked transcripts. It is off by default, and `recipe.py` refuses it on any
+  set but the speaker set.
 
 Writes the audio into a flat directory plus the two-column TSV that
 `scripts/common/ingest_recordings.py` consumes, so the existing ingestion path is unchanged.
@@ -58,7 +61,7 @@ def read_tsv(p: Path) -> list[dict]:
         return list(csv.DictReader(fh, delimiter="\t"))
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--splits", nargs="+", default=["validated", "other"])
@@ -78,24 +81,22 @@ def main() -> int:
     ap.add_argument("--accent-contains", nargs="*", default=None,
                     help="Keep only clips whose accents field contains one of these "
                          "substrings, e.g. --accent-contains 'Hong Kong' 香港")
-    # BOTH OF THESE WERE UNREACHABLE, AND THAT MADE A REGISTERED EXPERIMENT
-    # UNBUILDABLE. --require-colloquial was declared `action="store_true",
-    # default=True`, so passing it set what was already set and there was no way to
-    # turn it off; down-votes were dropped by an unconditional branch with no flag at
-    # all. The docstring above says the register filter is "Optional, on by default"
-    # and it was not optional. EXP-046 registers both arms on a DURATION-ONLY chain
-    # and could not be built at all until this was fixed.
+    # Both filters take a --no-... form (BooleanOptionalAction). The register filter was
+    # once declared store_true with default=True, so it could not be turned off at all.
     #
-    # Both default to the previous behaviour, so every selection ever made with this
-    # script still reproduces byte for byte. BooleanOptionalAction gives the
-    # --no-... form, which is the half that was missing.
+    # THE REGISTER FILTER IS OFF BY DEFAULT AND NEVER FOR A LANGUAGE PHASE. It keeps
+    # only transcripts carrying a colloquial Cantonese marker, which drops formal
+    # written Chinese, idioms, place names and short phrases: exactly what a reader of
+    # books and news needs. On Common Voice zh-HK 27.0 (validated, 3-30 s, no
+    # down-votes) it halves the selection, 60,329 clips to 29,562. A selection made
+    # with the filter on now has to ask for it.
     ap.add_argument("--require-colloquial", action=argparse.BooleanOptionalAction,
-                    default=True,
+                    default=False,
                     help="keep only transcripts carrying colloquial Cantonese markers. "
-                         "On by default. --no-require-colloquial takes the register "
-                         "filter off, which is right for a SPEAKER phase -- register is "
-                         "the language phase's concern, and this script's own --gender "
-                         "help says gender is the speaker phase's job.")
+                         "Off by default, and never for a language phase: it drops formal "
+                         "written Chinese, idioms, place names and short phrases that the "
+                         "speakers read in Cantonese. An opt-in for a speaker phase only; "
+                         "recipe.py refuses it on any other set.")
     ap.add_argument("--drop-down-voted", action=argparse.BooleanOptionalAction,
                     default=True,
                     help="drop clips a listener flagged (down_votes > 0). On by "
@@ -111,7 +112,11 @@ def main() -> int:
     ap.add_argument("--client-id-file", type=Path,
                     help="a file of contributor ids, one per line, '#' for comments")
     ap.add_argument("--out-dir", type=Path, required=True)
-    args = ap.parse_args()
+    return ap
+
+
+def main() -> int:
+    args = build_parser().parse_args()
 
     if not (CV / "transcript/yue").is_dir():
         print(f"CV_ROOT is not a Common Voice yue download (no transcript/yue under {str(CV)!r})", file=sys.stderr)
@@ -192,7 +197,7 @@ def main() -> int:
     print(f"  dropped by gender != {args.gender}          : {n_gender}")
     print(f"  dropped by accent filter                   : {n_accent}")
     print(f"  dropped by down_votes > 0                   : {n_votes}")
-    print(f"  dropped by empty/non-colloquial transcript  : {n_colloq}")
+    print(f"  dropped by empty (or, opted in, non-colloquial) transcript: {n_colloq}")
     print(f"  KEPT: {len(stage)} clips")
     if stage:
         secs = [s["dur"] for s in stage]

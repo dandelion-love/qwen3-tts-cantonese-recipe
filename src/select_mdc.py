@@ -5,7 +5,8 @@
 transcript/<locale>). Common Voice 23.0 and later come only from MDC, as ONE .tar.gz whose members are
 `cv-corpus-<ver>/<locale>/clips/<file>.mp3` beside the TSVs. This script applies the same filters, imported from
 that script so the two cannot drift: split, duration from clip_durations.tsv, contributor, gender, accent,
-down-votes and the colloquial-marker register filter. It writes the same out-dir: audio/*.mp3, transcripts.tsv and
+down-votes and the colloquial-marker register filter (off by default and never for a language phase: it is an opt-in
+for a speaker phase, and recipe.py refuses it on any other set). It writes the same out-dir: audio/*.mp3, transcripts.tsv and
 selection.json, in the same seeded order.
 
     python src/select_mdc.py \\
@@ -81,7 +82,7 @@ def select(rows: list[dict], durs: dict, a) -> tuple[list[dict], dict]:
     return stage, n
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--archive", type=Path)
     ap.add_argument("--locale")
@@ -90,7 +91,11 @@ def main() -> int:
     ap.add_argument("--max-duration", type=float, default=30.0)
     ap.add_argument("--gender", default="female_feminine")
     ap.add_argument("--accent-contains", nargs="*", default=None)
-    ap.add_argument("--require-colloquial", action=argparse.BooleanOptionalAction, default=True)
+    # Off by default, never for a language phase: it drops formal written Chinese, idioms, place names and short
+    # phrases that the speakers read in Cantonese (on zh-HK 27.0 validated, 3-30 s, no down-votes: 60,329 -> 29,562).
+    ap.add_argument("--require-colloquial", action=argparse.BooleanOptionalAction, default=False,
+                    help="keep only transcripts with colloquial Cantonese markers. Off by default; never for a "
+                         "language phase. An opt-in for a speaker phase only (recipe.py refuses it elsewhere).")
     ap.add_argument("--drop-down-voted", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--client-id", nargs="*", default=None)
     # The speaker set is one contributor. Her Common Voice pseudonym is passed in a file kept OUTSIDE this
@@ -100,6 +105,11 @@ def main() -> int:
     ap.add_argument("--out-dir", type=Path)
     ap.add_argument("--dry-run", action="store_true", help="count only; extract nothing")
     ap.add_argument("--self-test", action="store_true")
+    return ap
+
+
+def main() -> int:
+    ap = build_parser()
     a = ap.parse_args()
     if a.self_test:
         return self_test()
@@ -159,7 +169,8 @@ def main() -> int:
 
 
 def self_test() -> int:
-    """The filters, each shown to drop what it should; a red where a guard is emptied."""
+    """The filters, each shown to drop what it should; a red where a guard is emptied. The register filter is tested
+    switched on explicitly, as a speaker phase would opt in to it."""
     fails = 0
 
     def check(name, cond):
@@ -181,6 +192,9 @@ def self_test() -> int:
     a.require_colloquial = False
     check("RED: with the register filter off the formal sentence gets through (the filter is what drops it)",
           "formal.mp3" in [s["path"] for s in select(rows, durs, a)[0]])
+    check("the register filter is off unless asked for (never for a language phase)",
+          build_parser().parse_args([]).require_colloquial is False
+          and build_parser().parse_args(["--require-colloquial"]).require_colloquial is True)
     print("PASS" if not fails else f"FAIL: {fails}")
     return 1 if fails else 0
 

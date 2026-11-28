@@ -72,6 +72,7 @@ class Recipe:
         self.cfg = tomllib.loads(config.read_text(encoding="utf-8"))
         self.config_path = config
         self.dry = dry
+        check_register(self.cfg)
         self.paths = {k: expand(v) for k, v in self.cfg["paths"].items()}
         self.py = self.paths.get("python") or sys.executable
 
@@ -196,6 +197,39 @@ def card_memory():
     return cm
 
 
+SPEAKER_SETS = ("speaker",)                      # the only [data] sets that may opt in to the register filter
+
+
+def check_register(cfg: dict) -> None:
+    """Refuse a language-phase set configured with the register filter (require_colloquial = true).
+
+    The filter keeps only transcripts carrying a colloquial Cantonese marker. That drops formal written Chinese,
+    idioms, place names and short phrases which the speakers read in Cantonese: the material a model reading books and
+    news needs. It never applies to language data. Every [data] set except the speaker set is language data, including
+    any set added later, so the check walks all of them rather than a list of known names."""
+    bad = [w for w, d in cfg.get("data", {}).items()
+           if isinstance(d, dict) and d.get("require_colloquial") and w not in SPEAKER_SETS]
+    if bad:
+        raise SystemExit("[data." + "], [data.".join(bad) + "]: require_colloquial = true on a language set. The "
+                         "register filter drops formal written Chinese, idioms, place names and short phrases read in "
+                         "Cantonese, and never applies to language data; it is an opt-in for [data.speaker] only")
+
+
+def check_preselected_register(which: str, sel: Path) -> None:
+    """A language set given already selected must not have been selected with the register filter. Its selector's
+    selection.json says; a set without one cannot be checked, which is printed, not assumed."""
+    if which in SPEAKER_SETS:
+        return
+    meta = sel / "selection.json"
+    if not meta.is_file():
+        print(f"NOTE {which}: {sel} has no selection.json, so whether it was selected with the register filter "
+              "cannot be checked")
+        return
+    if json.loads(meta.read_text(encoding="utf-8")).get("filters", {}).get("require_colloquial"):
+        raise SystemExit(f"{which}: {meta} records require_colloquial = true. A language set must not be selected "
+                         "with the register filter; re-select it without one")
+
+
 def flag(name: str, on: bool) -> str:
     return f"--{name}" if on else f"--no-{name}"
 
@@ -215,13 +249,15 @@ def stage_select(r: Recipe) -> None:
             cv, mdc = "", str(r.path(d["archive"]))
         locale = d.get("locale", r.cfg["data"]["language"]["locale"])
         common = ["--splits", *d["splits"], "--min-duration", d["min_duration"], "--max-duration", d["max_duration"],
-                  "--gender", d["gender"], flag("require-colloquial", d["require_colloquial"]),
+                  "--gender", d["gender"], flag("require-colloquial", d.get("require_colloquial", False)),
                   flag("drop-down-voted", d["drop_down_voted"]), "--seed", d["seed"], "--out-dir", sel]
         if pre:                                    # already selected: audio/ + transcripts.tsv, ingest only
             sel = Path(pre)
             print(f"{which}: pre-selected at {sel} ([paths].{d['selected_dir']}); its selector is not run")
             if not r.dry and not ((sel / "audio").is_dir() and (sel / "transcripts.tsv").is_file()):
                 raise SystemExit(f"{sel} is not a selector output (audio/ and transcripts.tsv)")
+            if not r.dry:
+                check_preselected_register(which, sel)
         elif which == "speaker":
             common += ["--client-id-file", r.path("donor_ids")]
         if pre:
@@ -246,9 +282,12 @@ def stage_select(r: Recipe) -> None:
                       "transcripts_sha256": sha256(sel / "transcripts.tsv"),
                       "selection_ran": "no: given pre-selected" if pre else "yes",
                       "manifest": str(manifest), "manifest_sha256": sha256(manifest), "clips": n,
-                      "expect_clips": d.get("expect_clips"), "matches_expectation": n == d.get("expect_clips")}
-        if n != d.get("expect_clips"):
-            print(f"NOTE {which}: {n} clips, the lab's set had {d.get('expect_clips')} (reported, not refused)")
+                      "expect_clips": d.get("expect_clips"),
+                      "matches_expectation": None if d.get("expect_clips") is None else n == d["expect_clips"]}
+        if d.get("expect_clips") is None:
+            print(f"NOTE {which}: {n} clips; no expected count is recorded for this set")
+        elif n != d["expect_clips"]:
+            print(f"NOTE {which}: {n} clips, the lab's set had {d['expect_clips']} (reported, not refused)")
     r.record("select", {"sets": out})
 
 
